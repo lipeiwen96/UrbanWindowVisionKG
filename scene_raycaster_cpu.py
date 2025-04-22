@@ -1,9 +1,13 @@
 # scene_view.py
+from collections import Counter
+import sys
 import os
 import numpy as np
 from PIL import Image
 import time
 from datetime import datetime
+from numba import njit, prange
+
 
 # ============================
 # 1) 几何体生成模块
@@ -16,20 +20,20 @@ def create_box(center, size):
     size:   (dx,dy,dz) 长宽高
     """
     cx, cy, cz = center
-    sx, sy, sz = size[0]/2, size[1]/2, size[2]/2
+    sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
     verts = np.array([
-        [cx-sx, cy-sy, cz-sz], [cx+sx, cy-sy, cz-sz],
-        [cx+sx, cy+sy, cz-sz], [cx-sx, cy+sy, cz-sz],
-        [cx-sx, cy-sy, cz+sz], [cx+sx, cy-sy, cz+sz],
-        [cx+sx, cy+sy, cz+sz], [cx-sx, cy+sy, cz+sz],
+        [cx - sx, cy - sy, cz - sz], [cx + sx, cy - sy, cz - sz],
+        [cx + sx, cy + sy, cz - sz], [cx - sx, cy + sy, cz - sz],
+        [cx - sx, cy - sy, cz + sz], [cx + sx, cy - sy, cz + sz],
+        [cx + sx, cy + sy, cz + sz], [cx - sx, cy + sy, cz + sz],
     ], dtype=np.float32)
     faces = [
-        (0,1,2),(0,2,3),  # 底面
-        (4,6,5),(4,7,6),  # 顶面
-        (0,4,5),(0,5,1),  # 前面
-        (2,6,7),(2,7,3),  # 背面
-        (0,3,7),(0,7,4),  # 左侧
-        (1,5,6),(1,6,2),  # 右侧
+        (0, 1, 2), (0, 2, 3),  # 底面
+        (4, 6, 5), (4, 7, 6),  # 顶面
+        (0, 4, 5), (0, 5, 1),  # 前面
+        (2, 6, 7), (2, 7, 3),  # 背面
+        (0, 3, 7), (0, 7, 4),  # 左侧
+        (1, 5, 6), (1, 6, 2),  # 右侧
     ]
     return verts, faces
 
@@ -41,17 +45,17 @@ def create_cylinder(center, height, radius, segments=12):
     cx, cy, cz = center
     verts = []
     for i in range(segments):
-        theta = 2*np.pi * i / segments
-        x, z = cx + radius*np.cos(theta), cz + radius*np.sin(theta)
-        verts.append((x, cy-height/2, z))
-        verts.append((x, cy+height/2, z))
+        theta = 2 * np.pi * i / segments
+        x, z = cx + radius * np.cos(theta), cz + radius * np.sin(theta)
+        verts.append((x, cy - height / 2, z))
+        verts.append((x, cy + height / 2, z))
     verts = np.array(verts, dtype=np.float32)
     faces = []
     for i in range(segments):
-        i0 = 2*i
-        i1 = (i0+2) % (2*segments)
-        faces.append((i0,   i1,   i1+1))
-        faces.append((i0,   i1+1, i0+1))
+        i0 = 2 * i
+        i1 = (i0 + 2) % (2 * segments)
+        faces.append((i0, i1, i1 + 1))
+        faces.append((i0, i1 + 1, i0 + 1))
     return verts, faces
 
 
@@ -69,7 +73,6 @@ def create_cone_tree(base_center, height, radius, segments=12):
     # 树冠圆锥
     cx, cy, cz = base_center
     crown_h = height * 0.7
-    # 圆锥顶点
     apex = np.array([cx, cy+trunk_h+crown_h, cz], dtype=np.float32)
     circle_verts = []
     for i in range(segments):
@@ -78,14 +81,12 @@ def create_cone_tree(base_center, height, radius, segments=12):
         z = cz + radius*np.sin(theta)
         circle_verts.append((x, cy+trunk_h, z))
     circle_verts = np.array(circle_verts, dtype=np.float32)
-    # 构建三角面
     cone_faces = []
     for i in range(segments):
         cone_faces.append((0, i+1, (i+1)%segments+1))
     cone_verts = np.vstack((apex.reshape(1,3), circle_verts))
     # 合并几何
     verts = np.vstack((trunk_verts, cone_verts))
-    # adjust face indices
     faces = trunk_faces + [(f[0]+len(trunk_verts), f[1]+len(trunk_verts), f[2]+len(trunk_verts)) for f in cone_faces]
     return verts, faces
 
@@ -160,28 +161,49 @@ def build_scene():
 # ============================
 # 3) 光线-三角形相交
 # ============================
+@njit
 def intersect_ray_triangle(orig, dir, v0, e1, e2):
-    eps = 1e-6
-    h = np.cross(dir, e2)
-    a = np.dot(e1, h)
-    if abs(a) < eps: return np.inf
-    f = 1.0 / a
-    s = orig - v0
-    u = f * np.dot(s, h)
-    if u < 0.0 or u > 1.0: return np.inf
-    q = np.cross(s, e1)
-    v = f * np.dot(dir, q)
-    if v < 0.0 or u + v > 1.0: return np.inf
-    t = f * np.dot(e2, q)
+    eps = np.float32(1e-6)
+    # 手写 cross = dir × e2
+    h0 = dir[1] * e2[2] - dir[2] * e2[1]
+    h1 = dir[2] * e2[0] - dir[0] * e2[2]
+    h2 = dir[0] * e2[1] - dir[1] * e2[0]
+    # 手写 dot = e1 ⋅ h
+    a = e1[0] * h0 + e1[1] * h1 + e1[2] * h2
+    if abs(a) < eps:
+        return np.inf
+
+    f = np.float32(1.0) / a
+    # s = orig - v0
+    s0 = orig[0] - v0[0]
+    s1 = orig[1] - v0[1]
+    s2 = orig[2] - v0[2]
+    # u = f * (s ⋅ h)
+    u = f * (s0 * h0 + s1 * h1 + s2 * h2)
+    if u < 0.0 or u > 1.0:
+        return np.inf
+
+    # q = s × e1
+    q0 = s1 * e1[2] - s2 * e1[1]
+    q1 = s2 * e1[0] - s0 * e1[2]
+    q2 = s0 * e1[1] - s1 * e1[0]
+    # v = f * (dir ⋅ q)
+    v = f * (dir[0] * q0 + dir[1] * q1 + dir[2] * q2)
+    if v < 0.0 or u + v > 1.0:
+        return np.inf
+
+    # t = f * (e2 ⋅ q)
+    t = f * (e2[0] * q0 + e2[1] * q1 + e2[2] * q2)
     return t if t > eps else np.inf
 
 # ============================
-# 4) 光线投射
+# 4) 光线投射 (并行加速)
 # ============================
-def raytrace(v0s, e1s, e2s, labels, colors,
-             cam_o, cam_dir, right, up,
-             screen_w, screen_h, W, H,
-             verbose=False):
+@njit(parallel=True)
+def raytrace_fast(v0s, e1s, e2s, labels, colors,
+                  cam_o, cam_dir, right, up,
+                  screen_w, screen_h, W, H,
+                  verbose=False):
     """
     逐像素发射光线，返回视图RGB、深度、语义标签、交点坐标阵列。
     verbose=True 打印行进度。
@@ -282,11 +304,10 @@ def main():
 
     print('[3/6] Raytracing...')
     t1 = time.time()
-    rgb, depth, sem_lbl, pts = raytrace(
+    rgb, depth, sem_lbl, pts = raytrace_fast(
         v0s, e1s, e2s, labs, cols,
         cam_o, cam_dir, right, up,
-        screen_w, screen_h, W, H,
-        verbose=True
+        screen_w, screen_h, W, H
     )
     print(f'    Raytracing done: {time.time()-t1:.2f}s')
 
