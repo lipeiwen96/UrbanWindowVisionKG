@@ -1,8 +1,8 @@
 ﻿# -*- coding: utf-8 -*-
-# from collections import Counter # 预留统计功能
 import os
 import time
 from datetime import datetime
+import math # 需要 math 模块
 
 import numpy as np
 from PIL import Image
@@ -11,61 +11,71 @@ from numba import njit, prange
 # -- GPU Availability Check --------------------------------------------------
 try:
     from numba import cuda
-    cuda.detect()  # Raises CudaSupportError if no GPU or CUDA toolkit found
-    _GPU_AVAILABLE = True
-    print(f"CUDA available: {_GPU_AVAILABLE}")
-    print(f"Using GPU: {cuda.get_current_device().name.decode()}")
+    # Check if a CUDA device is available and context can be created
+    if cuda.is_available():
+        # Try to detect and get device name
+        try:
+            cuda.detect()  # This will print device info if successful
+            device = cuda.get_current_device()
+            print(f"CUDA 可用: True")
+            print(f"使用 GPU: {device.name.decode()}")
+            _GPU_AVAILABLE = True
+        except Exception as e_detect:
+            print(f"CUDA 检测或获取设备名时出错: {e_detect}")
+            print("CUDA 可能仍可用，但信息不完整。")
+            _GPU_AVAILABLE = True # Let's try anyway
+    else:
+        print("CUDA 不可用: 未检测到兼容设备或驱动程序.")
+        _GPU_AVAILABLE = False
+
+except ImportError:
+    print("Numba CUDA 扩展未安装或导入失败.")
+    _GPU_AVAILABLE = False
 except Exception as e:
-    print(f"CUDA not available or error during detection: {e}")
+    print(f"CUDA 初始化时发生未知错误: {e}")
     _GPU_AVAILABLE = False
 
-# --- Constants for Precision and Data Types ---
-# NOTE: Ray tracing heavily relies on floating-point precision for geometry
-#       calculations (directions, intersections, distances). Using integers
-#       directly for these would lead to significant accuracy loss and incorrect results.
-#       float32 is generally the standard and provides a good balance of
-#       precision and performance on GPUs. float16 could be an option for
-#       memory/bandwidth savings but might introduce precision issues.
-#       Optimizations like scaling/quantizing to integers for transfer often
-#       introduce more overhead (conversion cost) than they save, especially
-#       compared to acceleration structures.
+
+# --- 常量定义 ---
 GEOMETRY_DTYPE = np.float32
 INDEX_DTYPE = np.int32
 COLOR_DTYPE = np.uint8
 LABEL_DTYPE = np.int32
 DEPTH_DTYPE = np.float32
-POINT_DTYPE = np.float32 # Intersection points require float precision
+POINT_DTYPE = np.float32
+BVH_NODE_DTYPE = np.float32 # BVH 节点数据类型 (AABB用)
+INF = GEOMETRY_DTYPE(np.inf)
+EPSILON = GEOMETRY_DTYPE(1e-6) # Epsilon for general float comparisons
+BVH_MAX_LEAF_SIZE = 4 # BVH 叶子节点最大包含的图元数量
 
-# --- Global Color Map --- <<< MOVE C HERE
-# Define colors using the COLOR_DTYPE, accessible globally
+# --- 全局颜色映射 ---
 C = {
-    0: np.array([150, 200, 150], dtype=COLOR_DTYPE), # Grass (Also often used for background in palette)
-    1: np.array([200, 200, 200], dtype=COLOR_DTYPE), # Building
-    2: np.array([220, 180, 50], dtype=COLOR_DTYPE),  # Road
-    3: np.array([90, 140, 210], dtype=COLOR_DTYPE),  # Water
-    4: np.array([210, 80, 80], dtype=COLOR_DTYPE),   # Skyscraper/Special
-    5: np.array([0, 140, 0], dtype=COLOR_DTYPE),     # Tree
-    6: np.array([120, 120, 120], dtype=COLOR_DTYPE)  # Mountain
+    0: np.array([150, 200, 150], dtype=COLOR_DTYPE), # 草地 (背景/默认)
+    1: np.array([200, 200, 200], dtype=COLOR_DTYPE), # 建筑
+    2: np.array([220, 180, 50], dtype=COLOR_DTYPE),  # 道路
+    3: np.array([90, 140, 210], dtype=COLOR_DTYPE),  # 水面
+    4: np.array([210, 80, 80], dtype=COLOR_DTYPE),   # 摩天楼/特殊建筑
+    5: np.array([0, 140, 0], dtype=COLOR_DTYPE),     # 树木
+    6: np.array([120, 120, 120], dtype=COLOR_DTYPE)  # 山脉
 }
-# Optional: Define a separate explicit background color for the semantic image palette
-PALETTE_BACKGROUND_COLOR = (0, 0, 0)
+PALETTE_BACKGROUND_COLOR = (0, 0, 0) # 语义图像背景色 (黑色)
+DEFAULT_SKY_COLOR = np.array([135, 206, 235], dtype=COLOR_DTYPE) # 淡蓝色天空
 
-# --- Utility Functions ------------------------------------------------------
+# --- 工具函数 ---
 def _now() -> float:
-    """High-resolution timestamp"""
+    """高精度时间戳"""
     return time.perf_counter()
 
 def log_step(title: str, t0: float) -> None:
-    """Log duration of a step"""
-    print(f"    {title} took {_now() - t0:.2f}s")
+    """阶段耗时打印"""
+    print(f"    {title} 用时 {_now() - t0:.3f}s") # Increased precision
 
-# --- Random Number Generator (Reproducible) --------------------------------
+# --- 随机数生成器 (可复现) ---
 RAND = np.random.default_rng(seed=0)
 
-# --- Geometry Generation Functions -----------------------------------------
-# (Keep these functions as they are, ensuring they output GEOMETRY_DTYPE)
+# --- 几何体生成函数 ---
+# (保持不变)
 def create_box(center, size):
-    """Generates an axis-aligned box (8 verts, 12 tris)"""
     cx, cy, cz = center
     sx, sy, sz = size[0] / 2, size[1] / 2, size[2] / 2
     verts = np.array([
@@ -73,15 +83,14 @@ def create_box(center, size):
         [cx + sx, cy + sy, cz - sz], [cx - sx, cy + sy, cz - sz],
         [cx - sx, cy - sy, cz + sz], [cx + sx, cy - sy, cz + sz],
         [cx + sx, cy + sy, cz + sz], [cx - sx, cy + sy, cz + sz],
-    ], dtype=GEOMETRY_DTYPE) # Use defined dtype
+    ], dtype=GEOMETRY_DTYPE)
     faces = [
         (0, 1, 2), (0, 2, 3), (4, 6, 5), (4, 7, 6), (0, 4, 5), (0, 5, 1),
         (3, 2, 6), (3, 6, 7), (0, 3, 7), (0, 7, 4), (1, 5, 6), (1, 6, 2),
-    ]
+    ] # 12 triangles
     return verts, faces
 
-def create_prism(center, height, radius, sides=3):
-    """Generates a prism"""
+def create_prism(center, height, radius, sides=5):
     cx, cy, cz = center
     half = height / 2
     verts = []
@@ -90,828 +99,1153 @@ def create_prism(center, height, radius, sides=3):
         x, z = cx + radius * np.cos(th), cz + radius * np.sin(th)
         verts.append((x, cy - half, z))
         verts.append((x, cy + half, z))
-    verts = np.asarray(verts, dtype=GEOMETRY_DTYPE) # Use defined dtype
+    verts = np.asarray(verts, dtype=GEOMETRY_DTYPE)
     faces = []
     for i in range(sides):
         i0, i1 = 2 * i, (2 * (i + 1)) % (2 * sides)
         faces.append((i0, i1, i1 + 1))
-        faces.append((i0, i1 + 1, i0 + 1))
+        faces.append((i0, i1 + 1, i0 + 1)) # 2*sides triangles
     return verts, faces
 
-def create_skyscraper(center, base, height, levels=5, taper=0.7):
-    """Generates a tapered skyscraper"""
+def create_skyscraper(center, base, height, levels=8, taper=0.85):
     verts, faces = [], []
     cx, cy, cz = center
     seg_h = height / levels
     cur_w = base
-    offset = 0
+    offset = 0 # Start from the base y provided in 'center'
     for lv in range(levels):
         seg_center = (cx, cy + offset + seg_h / 2, cz)
         v, f = create_box(seg_center, (cur_w, seg_h, cur_w))
         o = len(verts)
-        verts.extend(v) # Extends with GEOMETRY_DTYPE arrays
+        verts.extend(v)
         faces.extend([(a + o, b + o, c + o) for a, b, c in f])
         offset += seg_h
-        cur_w *= taper
-    return np.asarray(verts, dtype=GEOMETRY_DTYPE), faces # Final conversion
+        cur_w *= taper # 12 * levels triangles
+    return np.asarray(verts, dtype=GEOMETRY_DTYPE), faces
 
-def create_cylinder(center, height, radius, *, segments: int = 12):
-    """Generates a cylinder"""
+def create_cylinder(center, height, radius, *, segments: int = 16):
     cx, cy, cz = center
     verts = []
     half_h = height / 2
     for i in range(segments):
         th = 2 * np.pi * i / segments
-        x = cx + radius * np.cos(th); z = cz + radius * np.sin(th)
+        x = cx + radius * np.cos(th)
+        z = cz + radius * np.sin(th)
         verts.append((x, cy - half_h, z))
         verts.append((x, cy + half_h, z))
-    verts = np.asarray(verts, dtype=GEOMETRY_DTYPE) # Use defined dtype
+    verts = np.asarray(verts, dtype=GEOMETRY_DTYPE)
     faces = []
     for i in range(segments):
         i0 = 2 * i
         i1 = (i0 + 2) % (2 * segments)
         faces.append((i0, i1, i1 + 1))
-        faces.append((i0, i1 + 1, i0 + 1))
+        faces.append((i0, i1 + 1, i0 + 1)) # 2 * segments triangles
     return verts, faces
 
-def create_cone_tree(base_center, height, radius, *, segments: int = 12):
-    """Generates a simple cone tree"""
-    cx, cy, cz = base_center
+def create_cone_tree(base_center, height, radius, *, segments: int = 10):
+    cx, cy, cz = base_center # Base y is included here
     trunk_h = height * 0.3
     trunk_r = radius * 0.2
-    trunk_base_cy = cy + trunk_h / 2
+    trunk_base_cy = cy + trunk_h / 2 # Center y for the trunk cylinder
     trunk_verts, trunk_faces = create_cylinder(
         center=(cx, trunk_base_cy, cz),
-        height=trunk_h, radius=trunk_r, segments=segments) # Returns GEOMETRY_DTYPE
+        height=trunk_h, radius=trunk_r, segments=max(6, segments // 2))
 
     crown_h = height * 0.7
-    crown_base_y = cy + trunk_h
-    apex = np.array([cx, crown_base_y + crown_h, cz], dtype=GEOMETRY_DTYPE) # Use defined dtype
+    crown_base_y = cy + trunk_h # Y level where the cone base starts
+    apex = np.array([cx, crown_base_y + crown_h, cz], dtype=GEOMETRY_DTYPE) # Cone top vertex
     circle = []
     for i in range(segments):
         th = 2 * np.pi * i / segments
         x, z = cx + radius * np.cos(th), cz + radius * np.sin(th)
-        circle.append((x, crown_base_y, z))
-    circle = np.asarray(circle, dtype=GEOMETRY_DTYPE) # Use defined dtype
+        circle.append((x, crown_base_y, z)) # Vertices at the base of the cone
+    circle = np.asarray(circle, dtype=GEOMETRY_DTYPE)
 
-    # Cone faces reference vertices relative to cone_verts array
-    cone_faces = [(0, i + 1, (i + 1) % segments + 1) for i in range(segments)]
-    cone_verts = np.vstack((apex.reshape(1, 3), circle)) # Already GEOMETRY_DTYPE
+    cone_faces = []
+    num_circle_verts = len(circle)
+    for i in range(num_circle_verts):
+        # Apex index is 0 within cone_verts
+        # Current circle vertex index is i + 1
+        # Next circle vertex index is (i + 1) % num_circle_verts + 1
+        cone_faces.append((0, i + 1, (i + 1) % num_circle_verts + 1))
 
-    verts = np.vstack((trunk_verts, cone_verts)) # Combine GEOMETRY_DTYPE arrays
-    # Adjust cone face indices to account for trunk vertices
+    cone_verts = np.vstack((apex.reshape(1, 3), circle))
+
+    # Combine trunk and cone
+    verts = np.vstack((trunk_verts, cone_verts))
+    # Adjust cone face indices by the number of trunk vertices
     faces = trunk_faces + [(a + len(trunk_verts), b + len(trunk_verts), c + len(trunk_verts))
                            for a, b, c in cone_faces]
     return verts, faces
 
-def create_mountain_range(x_start, x_end, z_pos, *, segs=120, depth=12,
-                          h_min=18, h_max=45):
-    """Generates a mountain range segment"""
+def create_mountain_range(x_start, x_end, z_pos, *, segs=200, depth=25, h_min=18, h_max=50):
     xs = np.linspace(x_start, x_end, segs + 1, dtype=GEOMETRY_DTYPE)
-    # Generate smooth random heights using interpolation
-    # Use a smaller number of control points for noise to make it smoother
     num_noise_points = max(5, segs // 10)
     noise_xs = np.linspace(x_start, x_end, num_noise_points)
     noise_ys_raw = RAND.uniform(-1, 1, noise_xs.shape)
-    # Basic smoothing (moving average) - optional
-    # kernel_size = 3
-    # noise_ys_raw = np.convolve(noise_ys_raw, np.ones(kernel_size)/kernel_size, mode='same')
-    noise_ys = np.interp(xs, noise_xs, noise_ys_raw) # Interpolate to full resolution
-    base_heights = np.interp(noise_ys, (-1, 1), (h_min, h_max))
+    # Use some smoothing (e.g., moving average) on noise_ys_raw if needed
+    noise_ys = np.interp(xs, noise_xs, noise_ys_raw) # Linear interpolation
+    base_heights = np.interp(noise_ys, (-1, 1), (h_min, h_max)) # Map noise to height range
 
     verts, faces = [], []
-    zero_y = GEOMETRY_DTYPE(0) # Use dtype for constants
+    zero_y = GEOMETRY_DTYPE(0) # Base of the mountain segment will be at y=0 before final adjustment
     z_pos_dtype = GEOMETRY_DTYPE(z_pos)
     depth_dtype = GEOMETRY_DTYPE(depth)
-
     for i in range(segs):
         x0, x1 = xs[i], xs[i + 1]
         h0, h1 = base_heights[i], base_heights[i + 1]
-        # Ensure heights are GEOMETRY_DTYPE
-        h0_dtype = GEOMETRY_DTYPE(h0)
-        h1_dtype = GEOMETRY_DTYPE(h1)
-
-        # Define vertices for the current segment (ensure dtype)
-        v = [
-            (x0, zero_y, z_pos_dtype), (x1, zero_y, z_pos_dtype),
-            (x0, h0_dtype, z_pos_dtype), (x1, h1_dtype, z_pos_dtype),
-            (x0, zero_y, z_pos_dtype + depth_dtype), (x1, zero_y, z_pos_dtype + depth_dtype),
-            (x0, h0_dtype, z_pos_dtype + depth_dtype), (x1, h1_dtype, z_pos_dtype + depth_dtype),
-        ]
-        idx0 = len(verts)
-        verts.extend(v) # Extends list with tuples, will be converted later
-
-        # Define faces using vertex indices relative to the start of this segment
-        f = lambda a, b, c: (idx0 + a, idx0 + b, idx0 + c)
-        # Front face, Back face, Side faces, Top face
-        faces += [f(0, 1, 3), f(0, 3, 2),  # Front
-                  f(4, 6, 7), f(4, 7, 5),  # Back
-                  f(0, 4, 6), f(0, 6, 2),  # Left side
-                  f(1, 3, 7), f(1, 7, 5),  # Right side
-                  f(2, 6, 7), f(2, 7, 3)]  # Top
-                  # Add bottom faces if needed: f(0,5,1), f(0,4,5)
-
-    return np.asarray(verts, dtype=GEOMETRY_DTYPE), faces # Convert list of tuples
+        h0_dtype, h1_dtype = GEOMETRY_DTYPE(h0), GEOMETRY_DTYPE(h1)
+        # Define 8 vertices for the segment box
+        v = [(x0, zero_y, z_pos_dtype), (x1, zero_y, z_pos_dtype), # 0, 1: bottom front
+             (x0, h0_dtype, z_pos_dtype), (x1, h1_dtype, z_pos_dtype), # 2, 3: top front
+             (x0, zero_y, z_pos_dtype + depth_dtype), (x1, zero_y, z_pos_dtype + depth_dtype), # 4, 5: bottom back
+             (x0, h0_dtype, z_pos_dtype + depth_dtype), (x1, h1_dtype, z_pos_dtype + depth_dtype)] # 6, 7: top back
+        idx0 = len(verts) # Starting index for this segment's vertices
+        verts.extend(v)
+        f = lambda a, b, c: (idx0 + a, idx0 + b, idx0 + c) # Helper to offset indices
+        # Create faces for the mountain segment (10 triangles for a closed segment)
+        faces.append(f(0, 1, 3)); faces.append(f(0, 3, 2)) # Front face
+        faces.append(f(4, 6, 7)); faces.append(f(4, 7, 5)) # Back face
+        faces.append(f(0, 4, 6)); faces.append(f(0, 6, 2)) # Left face
+        faces.append(f(1, 3, 7)); faces.append(f(1, 7, 5)) # Right face
+        faces.append(f(2, 6, 7)); faces.append(f(2, 7, 3)) # Top face
+        # faces.append(f(0, 5, 4)); faces.append(f(0, 1, 5)) # Bottom face (optional)
+    return np.asarray(verts, dtype=GEOMETRY_DTYPE), faces
 
 
-# --- Scene Building -------------------------------------------------------
+# --- 场景构建 ---
 def build_scene():
-    """Builds the entire scene geometry"""
-    tris_geom, tris_labs, tris_cols = [], [], [] # Use more descriptive names
-    # Define colors using the COLOR_DTYPE
-    C = {
-        0: np.array([150, 200, 150], dtype=COLOR_DTYPE), # Grass
-        1: np.array([200, 200, 200], dtype=COLOR_DTYPE), # Building
-        2: np.array([220, 180, 50], dtype=COLOR_DTYPE),  # Road
-        3: np.array([90, 140, 210], dtype=COLOR_DTYPE),  # Water
-        4: np.array([210, 80, 80], dtype=COLOR_DTYPE),   # Skyscraper/Special
-        5: np.array([0, 140, 0], dtype=COLOR_DTYPE),     # Tree
-        6: np.array([120, 120, 120], dtype=COLOR_DTYPE)  # Mountain
-    }
+    """构建整个场景几何体"""
+    tris_geom, tris_labs, tris_cols = [], [], []
+
+    # --- 对象数量 ---
+    num_buildings = 1000
+    num_skyscrapers = 150
+    num_prisms = 150
+    num_trees = 3500
+    mountain_segs1 = 200
+    mountain_segs2 = 160
+    print(f"    目标对象数量: 建筑={num_buildings}, 摩天楼={num_skyscrapers}, 棱柱={num_prisms}, 树木={num_trees}")
 
     # Helper to add objects
     def add_object(verts, faces, label, color_map):
         color = color_map[label]
-        for a, b, c in faces:
-            # Ensure indices are within bounds
-            if a < len(verts) and b < len(verts) and c < len(verts):
-                tris_geom.append((verts[a], verts[b], verts[c]))
-                tris_labs.append(label)
-                tris_cols.append(color)
-            else:
-                 print(f"Warning: Face indices ({a},{b},{c}) out of bounds for verts length {len(verts)}")
+        for face_indices in faces:
+            if all(idx < len(verts) for idx in face_indices):
+                if len(face_indices) == 3:
+                    a, b, c = face_indices
+                    tris_geom.append((verts[a], verts[b], verts[c]))
+                    tris_labs.append(label)
+                    tris_cols.append(color)
+                # else: print(f"警告: 非三角形面索引 {face_indices}，已跳过。") # Optional warning
+            # else: print(f"警告: 面索引 {face_indices} 超出顶点数组范围 {len(verts)}，已跳过。") # Optional warning
 
+    # --- 地面和基准高度 ---
+    ground_y = -0.1 # Lower ground slightly more
+    base_y = ground_y + 0.01 # Base level for objects slightly above ground
 
-    # Ground
-    g_v, g_f = create_box((0, -0.05, 0), (160, 0.1, 160))
-    add_object(g_v, g_f, 0, C)
+    # 地面
+    g_v, g_f = create_box((0, ground_y + 0.005, 0), (200, 0.01, 200)) # Wider ground
+    add_object(g_v, g_f, 0, C) # Label 0: Grass
 
-    # Lake (only top surface)
-    lake_v, lake_f = create_box((30, 0.02, 40), (40, 0.05, 30))
-    # Indices for the top face: (4,6,5) -> verts[4], verts[6], verts[5]
-    #                          (4,7,6) -> verts[4], verts[7], verts[6]
-    # These correspond to face indices 2 and 3 in the standard box face list
-    add_object(lake_v, [lake_f[i] for i in [2, 3]], 3, C)
+    # 湖泊 (ensure surface is above base_y)
+    lake_y = base_y + 0.02
+    lake_v, lake_f = create_box((40, lake_y, 50), (50, 0.01, 40)) # Thin lake surface
+    add_object(lake_v, [lake_f[i] for i in [2, 3]], 3, C) # Label 3: Water (only top faces)
 
-    # Road Network
+    # 道路网格 (slightly above base_y)
+    road_y = base_y + 0.03
     road_w = 4.0
-    road_h = 0.1 # Slightly above ground/lake
-    grid_coords = np.linspace(-60, 60, 9, dtype=GEOMETRY_DTYPE)
+    road_h = 0.01 # Thin roads
+    grid_coords = np.linspace(-80, 80, 13, dtype=GEOMETRY_DTYPE) # Wider grid, more roads
     for x in grid_coords:
-        v, f = create_box((x, road_h/2, 0), (road_w, road_h, 160.0 + road_w)) # Extend slightly
-        add_object(v, f, 2, C)
+        v, f = create_box((x, road_y, 0), (road_w, road_h, 200.0 + road_w))
+        add_object(v, f, 2, C) # Label 2: Road
     for z in grid_coords:
-        # Avoid double-drawing intersections by adjusting length slightly? Or accept overlap.
-        v, f = create_box((0, road_h/2, z), (160.0 + road_w, road_h, road_w)) # Extend slightly
+        v, f = create_box((0, road_y, z), (200.0 + road_w, road_h, road_w))
         add_object(v, f, 2, C)
 
-    # Buildings
-    num_buildings = 120
-    for _ in range(num_buildings):
-        x, z = RAND.uniform(-60, 60), RAND.uniform(-60, 60)
-        # Simple check to avoid placing directly on lake (approximate)
-        if 10 < x < 50 and 25 < z < 55: continue
-        w = RAND.uniform(4, 10); h = RAND.uniform(6, 12)
-        v, f = create_box((x, h/2, z), (w, h, w))
+    # 放置区域边界
+    min_coord, max_coord = -85, 85 # Slightly larger placement area
+    lake_x_min, lake_x_max = 15, 65
+    lake_z_min, lake_z_max = 30, 70
+
+    # --- 放置物体 (确保物体基座在 base_y) ---
+
+    # 建筑
+    building_count = 0
+    for _ in range(num_buildings * 3): # Try placing more initially
+        if building_count >= num_buildings: break
+        x = RAND.uniform(min_coord, max_coord)
+        z = RAND.uniform(min_coord, max_coord)
+        if lake_x_min < x < lake_x_max and lake_z_min < z < lake_z_max: continue # Avoid lake
+        w = RAND.uniform(5, 12)
+        h = RAND.uniform(8, 18)
+        center_y = base_y + h / 2 # Center based on base_y
+        v, f = create_box((x, center_y, z), (w, h, w))
         add_object(v, f, 1, C)
+        building_count += 1
 
-    # Skyscrapers
-    num_skyscrapers = 25
-    for _ in range(num_skyscrapers):
-        x, z = RAND.uniform(-50, 50), RAND.uniform(-50, 50)
-        if 10 < x < 50 and 25 < z < 55: continue # Avoid lake
-        base = RAND.uniform(6, 10); h = RAND.uniform(30, 45)
-        v, f = create_skyscraper((x, 0, z), base, h, levels=6, taper=0.8)
-        add_object(v, f, 4, C) # Use label 4
+    # 摩天楼
+    skyscraper_count = 0
+    for _ in range(num_skyscrapers * 3):
+        if skyscraper_count >= num_skyscrapers: break
+        x = RAND.uniform(min_coord + 5, max_coord - 5)
+        z = RAND.uniform(min_coord + 5, max_coord - 5)
+        if lake_x_min < x < lake_x_max and lake_z_min < z < lake_z_max: continue
+        base_w = RAND.uniform(7, 12)
+        h = RAND.uniform(40, 60)
+        levels = RAND.integers(6, 10)
+        taper = RAND.uniform(0.8, 0.95)
+        # Skyscraper base starts at base_y
+        v, f = create_skyscraper((x, base_y, z), base_w, h, levels=levels, taper=taper)
+        add_object(v, f, 4, C)
+        skyscraper_count += 1
 
-    # Prisms
-    num_prisms = 30
-    for _ in range(num_prisms):
-        x, z = RAND.uniform(-55, 55), RAND.uniform(-55, 55)
-        if 10 < x < 50 and 25 < z < 55: continue # Avoid lake
-        r = RAND.uniform(4, 6); h = RAND.uniform(10, 18)
-        v, f = create_prism((x, h/2, z), h, r, sides=3)
-        add_object(v, f, 4, C) # Use label 4 (or a different one if needed)
+    # 棱柱建筑
+    prism_count = 0
+    for _ in range(num_prisms * 3):
+        if prism_count >= num_prisms: break
+        x = RAND.uniform(min_coord, max_coord)
+        z = RAND.uniform(min_coord, max_coord)
+        if lake_x_min < x < lake_x_max and lake_z_min < z < lake_z_max: continue
+        r = RAND.uniform(4, 7)
+        h = RAND.uniform(12, 22)
+        sides = RAND.integers(4, 7)
+        center_y = base_y + h / 2
+        v, f = create_prism((x, center_y, z), h, r, sides=sides)
+        add_object(v, f, 4, C) # Also label 4
+        prism_count += 1
 
-    # Trees
-    num_trees = 450
-    for _ in range(num_trees):
-        x, z = RAND.uniform(-70, 70), RAND.uniform(-70, 70)
-        # Avoid lake and roads (approximate checks)
-        on_lake = (10 < x < 50 and 25 < z < 55)
+    # 树木
+    tree_count = 0
+    for _ in range(num_trees * 3):
+        if tree_count >= num_trees: break
+        x = RAND.uniform(min_coord - 10, max_coord + 10) # Wider range for trees
+        z = RAND.uniform(min_coord - 10, max_coord + 10)
+        on_lake = (lake_x_min < x < lake_x_max and lake_z_min < z < lake_z_max)
         on_road = False
-        for gx in grid_coords: # Check vertical roads
-             if abs(x - gx) < road_w / 1.8: on_road = True; break
+        road_clearance = road_w / 1.5 # Wider clearance for trees
+        for gx in grid_coords:
+             if abs(x - gx) < road_clearance: on_road = True; break
         if not on_road:
-            for gz in grid_coords: # Check horizontal roads
-                if abs(z - gz) < road_w / 1.8: on_road = True; break
+            for gz in grid_coords:
+                if abs(z - gz) < road_clearance: on_road = True; break
         if on_lake or on_road: continue
 
-        h = RAND.uniform(5, 9)
-        v, f = create_cone_tree((x, 0, z), h, 1.8, segments=8) # Reduced segments for trees
+        h = RAND.uniform(6, 11)
+        r = RAND.uniform(1.5, 2.5)
+        segs = RAND.integers(8, 14)
+        # Tree base starts at base_y
+        v, f = create_cone_tree((x, base_y, z), h, r, segments=segs)
         add_object(v, f, 5, C)
+        tree_count += 1
 
-    # Mountain Range
-    m_v, m_f = create_mountain_range(x_start=-90, x_end=90, z_pos=70, segs=100, depth=25, h_min=20, h_max=55) # Adjusted params
+    # 山脉 (Ensure base is at base_y)
+    m_v, m_f = create_mountain_range(x_start=-120, x_end=120, z_pos=95, segs=mountain_segs1, depth=35, h_min=25, h_max=65)
+    m_v[:, 1] += base_y # Adjust height relative to base_y
     add_object(m_v, m_f, 6, C)
-    m_v2, m_f2 = create_mountain_range(x_start=-90, x_end=90, z_pos=95, segs=80, depth=20, h_min=15, h_max=40) # Second, further range
+
+    m_v2, m_f2 = create_mountain_range(x_start=-120, x_end=120, z_pos=130, segs=mountain_segs2, depth=30, h_min=20, h_max=50)
+    m_v2[:, 1] += base_y # Adjust height
     add_object(m_v2, m_f2, 6, C)
 
-
-    # Convert to Numpy arrays (Structure of Arrays - good for GPU)
+    # --- 数据转换 ---
     N = len(tris_geom)
-    if N == 0: # Handle empty scene case
-        print("Warning: Scene is empty!")
-        return (np.empty((0, 3), dtype=GEOMETRY_DTYPE),
-                np.empty((0, 3), dtype=GEOMETRY_DTYPE),
-                np.empty((0, 3), dtype=GEOMETRY_DTYPE),
-                np.empty(0, dtype=LABEL_DTYPE),
-                np.empty((0, 3), dtype=COLOR_DTYPE))
+    if N == 0:
+        print("警告: 场景为空!")
+        return (np.empty((0, 3), dtype=GEOMETRY_DTYPE), np.empty((0, 3), dtype=GEOMETRY_DTYPE),
+                np.empty((0, 3), dtype=GEOMETRY_DTYPE), np.empty(0, dtype=LABEL_DTYPE),
+                np.empty((0, 3), dtype=COLOR_DTYPE), np.empty(0, dtype=INDEX_DTYPE))
 
-    # Precompute edges and structure data
+    print(f"    实际生成对象: 建筑={building_count}, 摩天楼={skyscraper_count}, 棱柱={prism_count}, 树木={tree_count}")
+    print(f"    总计三角形数量: {N}")
+
     v0s = np.empty((N, 3), dtype=GEOMETRY_DTYPE)
-    e1s = np.empty((N, 3), dtype=GEOMETRY_DTYPE) # v1 - v0
-    e2s = np.empty((N, 3), dtype=GEOMETRY_DTYPE) # v2 - v0
-    labels = np.empty(N, dtype=LABEL_DTYPE)
-    colors = np.empty((N, 3), dtype=COLOR_DTYPE)
+    e1s = np.empty((N, 3), dtype=GEOMETRY_DTYPE)
+    e2s = np.empty((N, 3), dtype=GEOMETRY_DTYPE)
+    labels = np.array(tris_labs, dtype=LABEL_DTYPE)
+    colors = np.array(tris_cols, dtype=COLOR_DTYPE)
 
     for i, (v0, v1, v2) in enumerate(tris_geom):
         v0s[i] = v0
-        e1s[i] = np.subtract(v1, v0) # Use numpy subtract for clarity
-        e2s[i] = np.subtract(v2, v0)
-        labels[i] = tris_labs[i]
-        colors[i] = tris_cols[i]
+        e1s[i] = np.subtract(v1, v0, dtype=GEOMETRY_DTYPE)
+        e2s[i] = np.subtract(v2, v0, dtype=GEOMETRY_DTYPE)
 
-    return v0s, e1s, e2s, labels, colors
+    prim_indices = np.arange(N, dtype=INDEX_DTYPE)
+
+    return v0s, e1s, e2s, labels, colors, prim_indices
 
 
-# --- Ray-Triangle Intersection (CPU - Numba JIT) --------------------------
-# This is the Möller–Trumbore algorithm. It inherently uses float ops.
-@njit(fastmath=True) # Enable fastmath potentially unsafe optimizations
+# --- BVH 相关 -------------------------------------------------------------
+
+BVH_NODE_FIELDS = 8
+
+@njit(fastmath=True)
+def calculate_tri_aabb_numba(v0, e1, e2):
+    """Numba-optimized AABB calculation for a single triangle"""
+    v1 = v0 + e1
+    v2 = v0 + e2
+    min_coord = np.empty(3, dtype=GEOMETRY_DTYPE)
+    max_coord = np.empty(3, dtype=GEOMETRY_DTYPE)
+    for k in range(3):
+        min_coord[k] = min(v0[k], v1[k], v2[k])
+        max_coord[k] = max(v0[k], v1[k], v2[k])
+    return min_coord, max_coord
+
+@njit(fastmath=True)
+def calculate_bounds(indices, tri_aabbs_min, tri_aabbs_max):
+    """Calculate the bounding box enclosing a set of primitives"""
+    num_tris = len(indices)
+    if num_tris == 0:
+        return (np.full(3, INF, dtype=BVH_NODE_DTYPE), np.full(3, -INF, dtype=BVH_NODE_DTYPE))
+
+    first_idx = indices[0]
+    global_min = tri_aabbs_min[first_idx].copy()
+    global_max = tri_aabbs_max[first_idx].copy()
+
+    for i in range(1, num_tris):
+        idx = indices[i]
+        current_min = tri_aabbs_min[idx]
+        current_max = tri_aabbs_max[idx]
+        for k in range(3):
+            global_min[k] = min(global_min[k], current_min[k])
+            global_max[k] = max(global_max[k], current_max[k])
+
+    return global_min, global_max
+
+# Helper function for int32 to float32 bit-casting (Numba CPU)
+@njit
+def int32_to_float32_bits(val_int32):
+    """Reinterprets the bits of an int32 as a float32."""
+    int_array = np.array([val_int32], dtype=INDEX_DTYPE)
+    return int_array.view(BVH_NODE_DTYPE)[0]
+
+# Helper function for float32 to int32 bit-casting (Numba CPU)
+@njit
+def float32_to_int32_bits(val_float32):
+    """Reinterprets the bits of a float32 as an int32."""
+    float_array = np.array([val_float32], dtype=BVH_NODE_DTYPE)
+    return float_array.view(INDEX_DTYPE)[0]
+
+
+# --- BVH Build (Recursive Part - Numba JITted) ---
+@njit
+def recursive_build_numba(
+    current_node_idx, nodes_used, flat_nodes,
+    prim_indices, start_idx, end_idx,
+    tri_aabbs_min, tri_aabbs_max, tri_centers
+):
+    """Recursive BVH build function, optimized with Numba."""
+    num_prims = end_idx - start_idx
+    node = flat_nodes[current_node_idx]
+
+    # 1. Calculate bounds
+    indices_slice = prim_indices[start_idx:end_idx]
+    aabb_min, aabb_max = calculate_bounds(indices_slice, tri_aabbs_min, tri_aabbs_max)
+    node[0:3] = aabb_min
+    node[3:6] = aabb_max
+
+    # 2. Leaf node check
+    if num_prims <= BVH_MAX_LEAF_SIZE:
+        node[6] = int32_to_float32_bits(INDEX_DTYPE(start_idx))
+        # *** MODIFICATION: Store negative count for leaves ***
+        node[7] = int32_to_float32_bits(INDEX_DTYPE(-num_prims)) # Store negative count
+        return
+
+    # 3. Internal node: Choose split axis and position
+    extent = aabb_max - aabb_min
+    split_axis = np.argmax(extent)
+
+    if extent[split_axis] < EPSILON: # Handle zero extent (make leaf)
+        node[6] = int32_to_float32_bits(INDEX_DTYPE(start_idx))
+        # *** MODIFICATION: Store negative count for leaves ***
+        node[7] = int32_to_float32_bits(INDEX_DTYPE(-num_prims)) # Store negative count
+        return
+
+    split_coord = (aabb_min[split_axis] + aabb_max[split_axis]) * 0.5
+
+    # 4. Partition primitives
+    mid_point = start_idx
+    for i in range(start_idx, end_idx):
+        prim_idx = prim_indices[i]
+        if tri_centers[prim_idx, split_axis] < split_coord:
+            prim_indices[i], prim_indices[mid_point] = prim_indices[mid_point], prim_indices[i]
+            mid_point += 1
+
+    # Handle ineffective split
+    if mid_point == start_idx or mid_point == end_idx:
+        mid_point = start_idx + num_prims // 2
+
+    # 5. Allocate children nodes
+    left_child_idx = nodes_used[0]
+    nodes_used[0] += 1
+    right_child_idx = nodes_used[0]
+    nodes_used[0] += 1
+
+    # Store children indices (non-negative)
+    node[6] = int32_to_float32_bits(INDEX_DTYPE(left_child_idx))
+    node[7] = int32_to_float32_bits(INDEX_DTYPE(right_child_idx)) # Store right child index (non-negative)
+
+    # 6. Recursively build children
+    recursive_build_numba(left_child_idx, nodes_used, flat_nodes, prim_indices,
+                          start_idx, mid_point,
+                          tri_aabbs_min, tri_aabbs_max, tri_centers)
+    recursive_build_numba(right_child_idx, nodes_used, flat_nodes, prim_indices,
+                          mid_point, end_idx,
+                          tri_aabbs_min, tri_aabbs_max, tri_centers)
+
+
+def build_bvh(v0s, e1s, e2s, prim_indices_in):
+    """Builds the BVH using a top-down, middle-split approach."""
+    N = len(prim_indices_in)
+    if N == 0:
+        return np.empty((0, BVH_NODE_FIELDS), dtype=BVH_NODE_DTYPE), np.empty(0, dtype=INDEX_DTYPE)
+
+    t0_precompute = _now()
+    # 1. Precompute AABBs and centroids
+    tri_aabbs_min = np.empty((N, 3), dtype=BVH_NODE_DTYPE)
+    tri_aabbs_max = np.empty((N, 3), dtype=BVH_NODE_DTYPE)
+    tri_centers = np.empty((N, 3), dtype=BVH_NODE_DTYPE)
+
+    @njit(parallel=True)
+    def precompute_bounds_centers_parallel(num_tris, v0s_n, e1s_n, e2s_n,
+                                           aabbs_min_out, aabbs_max_out, centers_out):
+        for i in prange(num_tris):
+            v0, e1, e2 = v0s_n[i], e1s_n[i], e2s_n[i]
+            aabb_min, aabb_max = calculate_tri_aabb_numba(v0, e1, e2)
+            aabbs_min_out[i] = aabb_min
+            aabbs_max_out[i] = aabb_max
+            centers_out[i] = (aabb_min + aabb_max) * 0.5
+
+    precompute_bounds_centers_parallel(N, v0s, e1s, e2s, tri_aabbs_min, tri_aabbs_max, tri_centers)
+    log_step('BVH Precomputation', t0_precompute)
+
+    # 2. Allocate node space
+    max_nodes = max(1, 2 * N - 1) # Ensure at least 1 node if N=1
+    flat_nodes = np.zeros((max_nodes, BVH_NODE_FIELDS), dtype=BVH_NODE_DTYPE)
+
+    # 3. Initialize recursive build
+    ordered_prim_indices = np.copy(prim_indices_in)
+    nodes_used = np.array([1], dtype=INDEX_DTYPE) # Counter passed as mutable array
+
+    t0_recursive = _now()
+    # Call the Numba-jitted recursive function
+    recursive_build_numba(
+        0, nodes_used, flat_nodes,
+        ordered_prim_indices, 0, N,
+        tri_aabbs_min, tri_aabbs_max, tri_centers
+    )
+    log_step('BVH Recursive Build', t0_recursive)
+
+    # 4. Trim unused nodes
+    actual_nodes_used = nodes_used[0]
+    flat_nodes = flat_nodes[:actual_nodes_used]
+
+    print(f"    BVH 构建完成: {actual_nodes_used} 个节点.")
+    if actual_nodes_used > 0:
+        root_min = flat_nodes[0, 0:3]
+        root_max = flat_nodes[0, 3:6]
+        print(f"    根节点 AABB Min: [{root_min[0]:.2f}, {root_min[1]:.2f}, {root_min[2]:.2f}], "
+              f"Max: [{root_max[0]:.2f}, {root_max[1]:.2f}, {root_max[2]:.2f}]")
+        # Debug root node type
+        # root_info = float32_to_int32_bits(flat_nodes[0, 7])
+        # print(f"    根节点 Info (node[7] as int): {root_info}")
+
+    return flat_nodes, ordered_prim_indices
+
+
+# --- 光线-三角形相交 (CPU) ---
+@njit(fastmath=True)
 def intersect_ray_triangle_cpu(orig, dir, v0, e1, e2):
-    """Möller–Trumbore intersection algorithm (CPU version)"""
-    eps = GEOMETRY_DTYPE(1e-6) # Use defined dtype for epsilon
-    # Calculate determinant components using cross product (dir x e2)
-    h0 = dir[1] * e2[2] - dir[2] * e2[1]
-    h1 = dir[2] * e2[0] - dir[0] * e2[2]
-    h2 = dir[0] * e2[1] - dir[1] * e2[0]
-    # Determinant = e1 . (dir x e2)
-    a = e1[0] * h0 + e1[1] * h1 + e1[2] * h2
+    """Moller-Trumbore ray-triangle intersection test."""
+    h = np.cross(dir, e2)
+    a = np.dot(e1, h)
 
-    # Check if ray is parallel to triangle plane or determinant is near zero
-    if abs(a) < eps:
-        return GEOMETRY_DTYPE(np.inf)
+    if abs(a) < EPSILON: # Ray parallel to triangle plane
+        return INF
 
     f = GEOMETRY_DTYPE(1.0) / a
-    s = orig - v0 # Vector from v0 to ray origin
+    s = orig - v0
+    u = f * np.dot(s, h)
 
-    # Calculate u (barycentric coordinate) = f * (s . (dir x e2))
-    u = f * (s[0] * h0 + s[1] * h1 + s[2] * h2)
     if u < 0.0 or u > 1.0:
-        return GEOMETRY_DTYPE(np.inf)
+        return INF
 
-    # Calculate v (barycentric coordinate) = f * (dir . (s x e1))
-    # (s x e1) components
-    q0 = s[1] * e1[2] - s[2] * e1[1]
-    q1 = s[2] * e1[0] - s[0] * e1[2]
-    q2 = s[0] * e1[1] - s[1] * e1[0]
-    v = f * (dir[0] * q0 + dir[1] * q1 + dir[2] * q2)
+    q = np.cross(s, e1)
+    v = f * np.dot(dir, q)
+
     if v < 0.0 or u + v > 1.0:
-        return GEOMETRY_DTYPE(np.inf)
+        return INF
 
-    # Calculate t = f * (e2 . (s x e1))
-    t = f * (e2[0] * q0 + e2[1] * q1 + e2[2] * q2)
+    # Calculate t, the distance to intersection
+    t = f * np.dot(e2, q)
 
-    # Return t only if it's a forward intersection
-    return t if t > eps else GEOMETRY_DTYPE(np.inf)
+    return t if t > EPSILON else INF # Return t only if intersection is in front
 
-# --- Ray Tracing (CPU - Numba Parallel) -----------------------------------
-# NOTE: Without an acceleration structure (like BVH), this will be slow
-#       for large scenes, as every ray checks every triangle.
-@njit(parallel=True, fastmath=True) # Enable parallel execution and fastmath
-def raytrace_cpu(v0s, e1s, e2s, labels, colors,
-                 cam_o, cam_dir, right, up,
-                 screen_w, screen_h, W, H):
-    """Performs ray tracing on the CPU using Numba for parallelization."""
-    # Output arrays initialization
+# --- 光线-AABB 相交 (CPU) ---
+@njit(fastmath=True)
+def intersect_ray_aabb_cpu(orig, dir_inv, tmin_global, node_aabb_min, node_aabb_max):
+    """Ray-AABB intersection test (Slab Test) for CPU BVH traversal."""
+    t_near = -INF
+    t_far = INF
+    for k in range(3):
+        inv_d = dir_inv[k]
+        aabb_min_k = node_aabb_min[k]
+        aabb_max_k = node_aabb_max[k]
+
+        t1 = (aabb_min_k - orig[k]) * inv_d
+        t2 = (aabb_max_k - orig[k]) * inv_d
+
+        if t1 > t2: t1, t2 = t2, t1 # Ensure t1 is near, t2 is far
+
+        t_near = max(t_near, t1)
+        t_far = min(t_far, t2)
+
+        # Early exit conditions:
+        if t_near >= t_far or t_far < EPSILON or t_near >= tmin_global:
+            return False # Miss
+
+    return True # Hit
+
+
+# --- 光线追踪 (CPU - BVH) ---
+@njit(parallel=True, fastmath=True) # Re-enable parallel
+# @njit(fastmath=True) # Use non-parallel for debugging
+def raytrace_cpu_bvh(
+    flat_nodes, v0s_reordered, e1s_reordered, e2s_reordered,
+    labels_reordered, colors_reordered,
+    cam_o, cam_dir, right, up,
+    screen_w, screen_h, W, H
+):
+    """Performs ray tracing on the CPU using the BVH."""
     rgb = np.zeros((H, W, 3), dtype=COLOR_DTYPE)
-    depth = np.full((H, W), GEOMETRY_DTYPE(np.inf), dtype=DEPTH_DTYPE)
+    depth = np.full((H, W), INF, dtype=DEPTH_DTYPE)
     sem = np.zeros((H, W), dtype=LABEL_DTYPE)
-    pts = np.full((H, W, 3), GEOMETRY_DTYPE(np.nan), dtype=POINT_DTYPE)
+    pts = np.full((H, W, 3), np.nan, dtype=POINT_DTYPE)
 
-    # Pre-calculate constants for the loop
     inv_W = GEOMETRY_DTYPE(1.0 / W)
     inv_H = GEOMETRY_DTYPE(1.0 / H)
-    half_sw = GEOMETRY_DTYPE(0.5 * screen_w)
-    half_sh = GEOMETRY_DTYPE(0.5 * screen_h)
-    num_triangles = v0s.shape[0]
+    num_nodes = flat_nodes.shape[0]
+    num_tris_total = len(v0s_reordered) # Get total number of triangles
 
-    # Loop over pixels in parallel
-    for i in prange(H): # Use prange for parallel loops
+    if num_nodes == 0:
+        for i in prange(H): # Use prange with parallel=True
+             for j in range(W): rgb[i, j] = DEFAULT_SKY_COLOR
+        return rgb, depth, sem, pts
+
+    BVH_CPU_STACK_SIZE = 64
+
+    for i in prange(H): # Use prange with parallel=True
+        # Per-thread locals
+        node_stack = np.empty(BVH_CPU_STACK_SIZE, dtype=INDEX_DTYPE)
+        d = np.empty(3, dtype=GEOMETRY_DTYPE)
+        dir_inv = np.empty(3, dtype=GEOMETRY_DTYPE)
+
         for j in range(W):
-            # Calculate ray direction for the pixel center
-            u = (j + GEOMETRY_DTYPE(0.5)) * inv_W - GEOMETRY_DTYPE(0.5)
-            v = (i + GEOMETRY_DTYPE(0.5)) * inv_H - GEOMETRY_DTYPE(0.5) # Invert v for image coords? No, using up vector convention.
+            # 1. Calculate ray direction
+            u = (GEOMETRY_DTYPE(j) + 0.5) * inv_W - 0.5
+            v = (GEOMETRY_DTYPE(i) + 0.5) * inv_H - 0.5
+            d[0] = cam_dir[0] + u * screen_w * right[0] - v * screen_h * up[0]
+            d[1] = cam_dir[1] + u * screen_w * right[1] - v * screen_h * up[1]
+            d[2] = cam_dir[2] + u * screen_w * right[2] - v * screen_h * up[2]
 
-            # Direction = cam_dir + u * screen_w * right - v * screen_h * up
-            # (Using +v because image coordinates usually start from top-left,
-            #  but the formula uses typical graphics coordinates where +y is up)
-            # Let's stick to the original formula: -v * up
-            dir_x = cam_dir[0] + u * screen_w * right[0] - v * screen_h * up[0]
-            dir_y = cam_dir[1] + u * screen_w * right[1] - v * screen_h * up[1]
-            dir_z = cam_dir[2] + u * screen_w * right[2] - v * screen_h * up[2]
+            norm_sq = d[0]**2 + d[1]**2 + d[2]**2
+            if norm_sq < EPSILON**2: continue
+            inv_norm = GEOMETRY_DTYPE(1.0) / math.sqrt(norm_sq)
+            d *= inv_norm
 
-            # Normalize direction vector
-            norm = (dir_x**2 + dir_y**2 + dir_z**2)**0.5
-            # Avoid division by zero if norm is very small
-            if norm < GEOMETRY_DTYPE(1e-9): norm = GEOMETRY_DTYPE(1.0)
-            inv_norm = GEOMETRY_DTYPE(1.0) / norm
-            d = np.array([dir_x * inv_norm, dir_y * inv_norm, dir_z * inv_norm], dtype=GEOMETRY_DTYPE)
+            for k in range(3):
+                if abs(d[k]) < EPSILON:
+                    dir_inv[k] = math.copysign(INF, d[k])
+                else:
+                    dir_inv[k] = GEOMETRY_DTYPE(1.0) / d[k]
 
-            # Find the closest intersection
-            tmin = GEOMETRY_DTYPE(np.inf)
-            hit_idx = -1
-            for k in range(num_triangles):
-                t = intersect_ray_triangle_cpu(cam_o, d, v0s[k], e1s[k], e2s[k])
-                if t < tmin:
-                    tmin = t
-                    hit_idx = k
+            # 2. Initialize traversal
+            tmin = INF
+            hit_prim_idx = -1
+            stack_ptr = 0
+            node_stack[stack_ptr] = 0
+            stack_ptr += 1
 
-            # If an intersection was found, record hit information
-            if hit_idx >= 0:
+            # 3. BVH Traversal Loop
+            while stack_ptr > 0:
+                stack_ptr -= 1
+                node_idx = node_stack[stack_ptr]
+
+                if node_idx < 0 or node_idx >= num_nodes: continue
+
+                node = flat_nodes[node_idx]
+                node_aabb_min = node[0:3]
+                node_aabb_max = node[3:6]
+
+                aabb_hit = intersect_ray_aabb_cpu(cam_o, dir_inv, tmin, node_aabb_min, node_aabb_max)
+
+                if not aabb_hit: continue
+
+                # *** MODIFICATION: Check sign of node[7] to determine node type ***
+                info_bits = node[7]
+                info_val = float32_to_int32_bits(info_bits)
+
+                if info_val < 0: # Leaf Node (negative count stored)
+                    prim_count = -info_val # Get positive count
+                    prim_offset_bits = node[6]
+                    prim_offset = float32_to_int32_bits(prim_offset_bits)
+
+                    for p_local_idx in range(prim_count):
+                        p_idx = prim_offset + p_local_idx
+                        if p_idx < num_tris_total:
+                            t = intersect_ray_triangle_cpu(cam_o, d,
+                                                           v0s_reordered[p_idx],
+                                                           e1s_reordered[p_idx],
+                                                           e2s_reordered[p_idx])
+                            if t < tmin:
+                                tmin = t
+                                hit_prim_idx = p_idx
+
+                else: # Internal Node (info_val >= 0 is right_child_idx)
+                    left_child_idx_bits = node[6]
+                    left_child_idx = float32_to_int32_bits(left_child_idx_bits)
+                    right_child_idx = info_val # Already have the right child index
+
+                    if stack_ptr + 2 <= BVH_CPU_STACK_SIZE:
+                        # Check validity before pushing
+                        if left_child_idx >= 0 and left_child_idx < num_nodes:
+                            node_stack[stack_ptr] = left_child_idx
+                            stack_ptr += 1
+                        if right_child_idx >= 0 and right_child_idx < num_nodes:
+                            node_stack[stack_ptr] = right_child_idx
+                            stack_ptr += 1
+                    # else: # Handle stack overflow
+
+            # 4. Process hit result
+            if hit_prim_idx >= 0:
                 depth[i, j] = tmin
-                sem[i, j] = labels[hit_idx]
-                rgb[i, j, 0] = colors[hit_idx, 0]
-                rgb[i, j, 1] = colors[hit_idx, 1]
-                rgb[i, j, 2] = colors[hit_idx, 2]
-                # Calculate intersection point: P = O + t * D
-                pts[i, j, 0] = cam_o[0] + tmin * d[0]
-                pts[i, j, 1] = cam_o[1] + tmin * d[1]
-                pts[i, j, 2] = cam_o[2] + tmin * d[2]
-            # else: pixel remains background (inf depth, 0 sem, nan point, 0 rgb)
+                sem[i, j] = labels_reordered[hit_prim_idx]
+                rgb[i, j] = colors_reordered[hit_prim_idx]
+                hit_point = cam_o + tmin * d
+                pts[i, j, 0] = hit_point[0]
+                pts[i, j, 1] = hit_point[1]
+                pts[i, j, 2] = hit_point[2]
+            else:
+                rgb[i, j] = DEFAULT_SKY_COLOR
+                # depth, sem, pts remain INF, 0, NaN
 
     return rgb, depth, sem, pts
 
-# --- GPU Kernels (Only if _GPU_AVAILABLE) ---------------------------------
+
+# --- GPU 内核 ---
 if _GPU_AVAILABLE:
 
-    # NOTE: This is the core intersection logic ported to CUDA device function.
-    #       It still uses float32 (GEOMETRY_DTYPE). Attempting integer-only
-    #       math here would be complex and likely slower due to lack of native
-    #       support for the required geometric operations.
-    @cuda.jit(device=True, inline=True) # Aggressive inlining hint
+    # --- 光线-三角形相交 (GPU 设备函数) ---
+    @cuda.jit(device=True, inline=True)
     def ray_tri_intersect_gpu(orig, dir, v0, e1, e2):
-        """Möller–Trumbore intersection algorithm (CUDA Device Function)"""
-        # Use explicit type for constants within device code if needed, though Numba often infers correctly
-        eps = GEOMETRY_DTYPE(1e-6)
-        inf = GEOMETRY_DTYPE(1e20) # Use a large float for infinity representation in CUDA kernel
+        """Moller-Trumbore ray-triangle intersection test for GPU."""
+        eps_gpu = GEOMETRY_DTYPE(1e-6)
+        inf_gpu = GEOMETRY_DTYPE(1e20)
 
-        # Calculate determinant components (dir x e2)
         h0 = dir[1] * e2[2] - dir[2] * e2[1]
         h1 = dir[2] * e2[0] - dir[0] * e2[2]
         h2 = dir[0] * e2[1] - dir[1] * e2[0]
-        a = e1[0] * h0 + e1[1] * h1 + e1[2] * h2 # Determinant
+        a = e1[0] * h0 + e1[1] * h1 + e1[2] * h2
 
-        if abs(a) < eps:
-            return inf
-
+        if abs(a) < eps_gpu: return inf_gpu
         f = GEOMETRY_DTYPE(1.0) / a
-        # s = orig - v0 (calculate components directly)
         s0 = orig[0] - v0[0]; s1 = orig[1] - v0[1]; s2 = orig[2] - v0[2]
-
-        # Calculate u = f * (s . (dir x e2))
         u = f * (s0 * h0 + s1 * h1 + s2 * h2)
-        if u < 0.0 or u > 1.0:
-            return inf
 
-        # Calculate v = f * (dir . (s x e1))
-        # (s x e1) components
-        q0 = s1 * e1[2] - s2 * e1[1]
-        q1 = s2 * e1[0] - s0 * e1[2]
-        q2 = s0 * e1[1] - s1 * e1[0]
+        if u < 0.0 or u > 1.0: return inf_gpu
+        q0 = s1 * e1[2] - s2 * e1[1]; q1 = s2 * e1[0] - s0 * e1[2]; q2 = s0 * e1[1] - s1 * e1[0]
         v = f * (dir[0] * q0 + dir[1] * q1 + dir[2] * q2)
-        if v < 0.0 or u + v > 1.0:
-            return inf
 
-        # Calculate t = f * (e2 . (s x e1))
+        if v < 0.0 or u + v > 1.0: return inf_gpu
         t = f * (e2[0] * q0 + e2[1] * q1 + e2[2] * q2)
+        return t if t > eps_gpu else inf_gpu
 
-        # Check for positive t (intersection in front of ray origin)
-        return t if t > eps else inf
 
-    # NOTE: This CUDA kernel implements the same naive O(N*M) ray tracing.
-    #       The primary speedup comes from massive parallelism of the GPU,
-    #       not from algorithmic improvements (like BVH).
-    @cuda.jit #(fastmath=True) # fastmath can sometimes be unstable in CUDA JIT
-    def raytrace_cuda_kernel(v0s, e1s, e2s, labels, colors, # Scene data (device arrays)
-                             cam_o, cam_dir, right, up,      # Camera params (device arrays/scalars)
-                             scr_w, scr_h, W, H,             # Screen params (scalars)
-                             rgb, depth, sem, pts):          # Output arrays (device arrays)
-        """CUDA kernel for ray tracing one pixel per thread."""
-        # Get thread indices for the pixel
-        i, j = cuda.grid(2) # (row, col) or (y, x)
+    # --- 光线-AABB 相交 (GPU 设备函数) ---
+    @cuda.jit(device=True, inline=True)
+    def ray_aabb_intersect_gpu(orig, dir_inv, t_min_global, node_aabb_min, node_aabb_max):
+        """Ray-AABB intersection test (Slab Test) for GPU."""
+        t_near = -INF; t_far = INF
+        eps_aabb = GEOMETRY_DTYPE(1e-6)
 
-        # Check if thread indices are within the image bounds
-        if i >= H or j >= W:
+        for k in range(3):
+            inv_d = dir_inv[k]
+            aabb_min_k = node_aabb_min[k]
+            aabb_max_k = node_aabb_max[k]
+            t1 = (aabb_min_k - orig[k]) * inv_d
+            t2 = (aabb_max_k - orig[k]) * inv_d
+            if t1 > t2: t1, t2 = t2, t1
+            t_near = max(t_near, t1)
+            t_far = min(t_far, t2)
+            if t_near >= t_far or t_far < eps_aabb or t_near >= t_min_global:
+                return False # Miss
+        return True # Hit
+
+    # --- BVH 光线追踪 CUDA 内核 ---
+    @cuda.jit
+    def raytrace_cuda_bvh_kernel(
+        flat_nodes, v0s_reordered, e1s_reordered, e2s_reordered,
+        labels_reordered, colors_reordered,
+        cam_o, cam_dir, right, up,
+        scr_w, scr_h, W, H,
+        rgb, depth, sem, pts
+    ):
+        """CUDA kernel for ray tracing with BVH traversal."""
+        i, j = cuda.grid(2)
+        if i >= H or j >= W: return
+
+        # Constants & Local Arrays
+        inf_gpu = GEOMETRY_DTYPE(1e20)
+        eps_gpu = GEOMETRY_DTYPE(1e-6)
+        d = cuda.local.array(3, dtype=GEOMETRY_DTYPE)
+        dir_inv = cuda.local.array(3, dtype=GEOMETRY_DTYPE)
+        node_aabb_min = cuda.local.array(3, dtype=BVH_NODE_DTYPE)
+        node_aabb_max = cuda.local.array(3, dtype=BVH_NODE_DTYPE)
+        num_tris_total_gpu = v0s_reordered.shape[0]
+
+        # 1. Calculate ray direction
+        u = (GEOMETRY_DTYPE(j) + 0.5) / W - 0.5
+        v = (GEOMETRY_DTYPE(i) + 0.5) / H - 0.5
+        d[0] = cam_dir[0] + u * scr_w * right[0] - v * scr_h * up[0]
+        d[1] = cam_dir[1] + u * scr_w * right[1] - v * scr_h * up[1]
+        d[2] = cam_dir[2] + u * scr_w * right[2] - v * scr_h * up[2]
+
+        nrm_sq = d[0]**2 + d[1]**2 + d[2]**2
+        if nrm_sq < eps_gpu**2:
+             rgb[i, j, 0] = DEFAULT_SKY_COLOR[0]; rgb[i, j, 1] = DEFAULT_SKY_COLOR[1]; rgb[i, j, 2] = DEFAULT_SKY_COLOR[2]
+             depth[i, j] = inf_gpu; sem[i, j] = 0
+             return
+
+        inv_nrm = GEOMETRY_DTYPE(1.0) / math.sqrt(nrm_sq)
+        d[0] *= inv_nrm; d[1] *= inv_nrm; d[2] *= inv_nrm
+
+        for k in range(3):
+            if abs(d[k]) < eps_gpu: dir_inv[k] = math.copysign(inf_gpu, d[k])
+            else: dir_inv[k] = GEOMETRY_DTYPE(1.0) / d[k]
+
+        # 2. Initialize traversal
+        tmin = inf_gpu
+        hit_prim_idx = -1
+        num_nodes = flat_nodes.shape[0]
+        if num_nodes == 0:
+            rgb[i, j, 0] = DEFAULT_SKY_COLOR[0]; rgb[i, j, 1] = DEFAULT_SKY_COLOR[1]; rgb[i, j, 2] = DEFAULT_SKY_COLOR[2]
+            depth[i, j] = inf_gpu; sem[i, j] = 0
             return
 
-        # Calculate ray direction (same logic as CPU version)
-        # Use GEOMETRY_DTYPE for calculations inside the kernel
-        u = (GEOMETRY_DTYPE(j) + GEOMETRY_DTYPE(0.5)) / GEOMETRY_DTYPE(W) - GEOMETRY_DTYPE(0.5)
-        v = (GEOMETRY_DTYPE(i) + GEOMETRY_DTYPE(0.5)) / GEOMETRY_DTYPE(H) - GEOMETRY_DTYPE(0.5) # Corresponds to -v*up in world space
+        BVH_GPU_STACK_SIZE = 64
+        node_stack = cuda.local.array(BVH_GPU_STACK_SIZE, dtype=INDEX_DTYPE)
+        stack_ptr = 0
+        node_stack[stack_ptr] = 0
+        stack_ptr += 1
 
-        # Direction vector components (using local array for potential register optimization)
-        # Local array might not be necessary for simple vector math like this
-        # d0_x = cam_dir[0] + u*scr_w*right[0] - v*scr_h*up[0]
-        # d0_y = cam_dir[1] + u*scr_w*right[1] - v*scr_h*up[1]
-        # d0_z = cam_dir[2] + u*scr_w*right[2] - v*scr_h*up[2]
-        # Or use cuda.local.array if profiling shows register pressure:
-        d0 = cuda.local.array(3, dtype=GEOMETRY_DTYPE)
-        for k in range(3):
-             d0[k] = cam_dir[k] + u * scr_w * right[k] - v * scr_h * up[k]
+        # 3. BVH Traversal Loop
+        while stack_ptr > 0:
+            stack_ptr -= 1
+            node_idx = node_stack[stack_ptr]
 
-        # Normalize the direction vector
-        # Use cuda.local.array for norm calculation if needed, but direct calc is fine
-        nrm_sq = d0[0]**2 + d0[1]**2 + d0[2]**2
-        if nrm_sq < GEOMETRY_DTYPE(1e-18): # Check for near-zero norm before sqrt
-            # Handle degenerate case (e.g., set to a default direction or skip pixel)
-            # For now, just prevent division by zero / sqrt of zero
-             nrm = GEOMETRY_DTYPE(1.0)
-        else:
-            nrm = nrm_sq**0.5
+            if node_idx < 0 or node_idx >= num_nodes: continue
 
-        inv_nrm = GEOMETRY_DTYPE(1.0) / nrm
-        d0[0] *= inv_nrm; d0[1] *= inv_nrm; d0[2] *= inv_nrm
+            node_aabb_min[0] = flat_nodes[node_idx, 0]; node_aabb_min[1] = flat_nodes[node_idx, 1]; node_aabb_min[2] = flat_nodes[node_idx, 2]
+            node_aabb_max[0] = flat_nodes[node_idx, 3]; node_aabb_max[1] = flat_nodes[node_idx, 4]; node_aabb_max[2] = flat_nodes[node_idx, 5]
 
-        # --- Intersection Testing Loop ---
-        # This is the O(M) part. For large M, this dominates runtime.
-        # A BVH traversal would replace this loop.
-        tmin = GEOMETRY_DTYPE(1e20) # Initialize with large float value
-        hit = -1                   # Use -1 to indicate no hit initially
-        num_triangles = v0s.shape[0]
-        for k in range(num_triangles):
-            # Call the device function for intersection test
-            # Pass device array elements directly
-            t = ray_tri_intersect_gpu(cam_o, d0, v0s[k], e1s[k], e2s[k])
-            # Update minimum hit distance and index if a closer intersection is found
-            if t < tmin:
-                tmin = t
-                hit = k
-        # --- End Intersection Loop ---
+            if not ray_aabb_intersect_gpu(cam_o, dir_inv, tmin, node_aabb_min, node_aabb_max):
+                continue
 
-        # If a triangle was hit (hit >= 0)
-        if hit >= 0:
-            # Write results to the output device arrays for this pixel (i, j)
+            # *** MODIFICATION: Check sign of node[7] using .view() ***
+            info_bits_f = flat_nodes[node_idx, 7]
+            info_val = info_bits_f.view(INDEX_DTYPE) # Cast bits to int
+
+            if info_val < 0: # Leaf Node (negative count stored)
+                prim_count = -info_val # Get positive count
+                prim_offset_bits_f = flat_nodes[node_idx, 6]
+                prim_offset = prim_offset_bits_f.view(INDEX_DTYPE) # Cast bits
+
+                for p_idx_offset in range(prim_count):
+                    current_prim_idx = prim_offset + p_idx_offset
+                    if current_prim_idx < num_tris_total_gpu:
+                        tri_v0 = v0s_reordered[current_prim_idx]
+                        tri_e1 = e1s_reordered[current_prim_idx]
+                        tri_e2 = e2s_reordered[current_prim_idx]
+                        t = ray_tri_intersect_gpu(cam_o, d, tri_v0, tri_e1, tri_e2)
+                        if t < tmin:
+                            tmin = t
+                            hit_prim_idx = current_prim_idx
+
+            else: # Internal Node (info_val >= 0 is right_child_idx)
+                left_child_idx_bits_f = flat_nodes[node_idx, 6]
+                left_child_idx = left_child_idx_bits_f.view(INDEX_DTYPE) # Cast bits
+                right_child_idx = info_val # Already have the right child index
+
+                if stack_ptr + 2 <= BVH_GPU_STACK_SIZE:
+                    if left_child_idx >= 0 and left_child_idx < num_nodes:
+                        node_stack[stack_ptr] = left_child_idx
+                        stack_ptr += 1
+                    if right_child_idx >= 0 and right_child_idx < num_nodes:
+                        node_stack[stack_ptr] = right_child_idx
+                        stack_ptr += 1
+                # else: # Handle stack overflow
+
+        # 4. Process hit result
+        if hit_prim_idx >= 0:
             depth[i, j] = tmin
-            sem[i, j] = labels[hit] # Read label from device array
-            # Read color from device array and write to rgb output array
-            rgb[i, j, 0] = colors[hit, 0]
-            rgb[i, j, 1] = colors[hit, 1]
-            rgb[i, j, 2] = colors[hit, 2]
-            # Calculate intersection point P = O + t * D
-            pts[i, j, 0] = cam_o[0] + d0[0] * tmin
-            pts[i, j, 1] = cam_o[1] + d0[1] * tmin
-            pts[i, j, 2] = cam_o[2] + d0[2] * tmin
+            sem[i, j] = labels_reordered[hit_prim_idx]
+            color = colors_reordered[hit_prim_idx]
+            rgb[i, j, 0] = color[0]; rgb[i, j, 1] = color[1]; rgb[i, j, 2] = color[2]
+            pts[i, j, 0] = cam_o[0] + d[0] * tmin
+            pts[i, j, 1] = cam_o[1] + d[1] * tmin
+            pts[i, j, 2] = cam_o[2] + d[2] * tmin
         else:
-            # No hit: Write background values
-            # Depth already initialized to inf basically (1e20 here)
-            depth[i, j] = GEOMETRY_DTYPE(np.inf) # Or keep 1e20, but np.inf might be clearer on host
-            sem[i, j] = 0 # Assuming label 0 is background/unassigned
-            # RGB defaults to 0 (black)
-            # pts defaults to NaN (already initialized on host, not explicitly set here, but could be)
-            # Optional: Explicitly set background values if needed
-            # rgb[i, j, 0] = 0; rgb[i, j, 1] = 0; rgb[i, j, 2] = 0
-            # pts[i, j, 0] = GEOMETRY_DTYPE(np.nan); pts[i, j, 1] = GEOMETRY_DTYPE(np.nan); pts[i, j, 2] = GEOMETRY_DTYPE(np.nan)
+            # No hit
+            rgb[i, j, 0] = DEFAULT_SKY_COLOR[0]; rgb[i, j, 1] = DEFAULT_SKY_COLOR[1]; rgb[i, j, 2] = DEFAULT_SKY_COLOR[2]
+            depth[i, j] = inf_gpu
+            sem[i, j] = 0
+            # pts remain NaN
 
-
-# --- OBJ Export Function (Keep as is) -------------------------------------
+# --- OBJ 导出 ---
+# (保持不变)
 def save_combined_obj(filename, v0s, e1s, e2s,
-                      cam_o, cam_dir, right, up, screen_w, screen_h, # Added screen params
+                      cam_o, cam_dir, right, up, screen_w, screen_h,
                       pts, far):
-    """Saves scene triangles, camera frustum, and hit points to OBJ"""
-    with open(filename, 'w') as f:
-        f.write(f'# Raytracer output: {datetime.now()}\n')
-        f.write('# Scene triangles\n')
-        vidx = 1 # OBJ indices start from 1
+    """Saves scene triangles, camera frustum, and hit points to an OBJ file."""
+    print(f"    准备保存 OBJ 文件: {filename}")
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f'# Raytracer output: {datetime.now()}\n')
+            f.write(f'# Generated with {len(v0s)} triangles.\n')
 
-        # Write triangle vertices and faces
-        for i in range(v0s.shape[0]):
-            v0 = v0s[i]
-            v1 = v0 + e1s[i]
-            v2 = v0 + e2s[i]
-            f.write(f"v {v0[0]:.6f} {v0[1]:.6f} {v0[2]:.6f}\n")
-            f.write(f"v {v1[0]:.6f} {v1[1]:.6f} {v1[2]:.6f}\n")
-            f.write(f"v {v2[0]:.6f} {v2[1]:.6f} {v2[2]:.6f}\n")
-            f.write(f"f {vidx}// {vidx+1}// {vidx+2}//\n") # Using // for faces without texture/normals
-            vidx += 3
+            # --- Scene Triangles ---
+            f.write('\n# Scene Geometry (Triangles)\n')
+            f.write('o scene_geometry\n')
+            vidx = 1 # OBJ indices start from 1
+            for i in range(v0s.shape[0]):
+                v0 = v0s[i]; v1 = v0 + e1s[i]; v2 = v0 + e2s[i]
+                f.write(f"v {v0[0]:.6f} {v0[1]:.6f} {v0[2]:.6f}\n")
+                f.write(f"v {v1[0]:.6f} {v1[1]:.6f} {v1[2]:.6f}\n")
+                f.write(f"v {v2[0]:.6f} {v2[1]:.6f} {v2[2]:.6f}\n")
+                f.write(f"f {vidx}// {vidx+1}// {vidx+2}//\n")
+                vidx += 3
 
-        # Write camera frustum lines
-        f.write('\n# Camera frustum\n')
-        f.write(f"o camera_frustum\n")
-        f.write(f"v {cam_o[0]:.6f} {cam_o[1]:.6f} {cam_o[2]:.6f}\n") # Camera origin (index vidx)
-        cam_v_start = vidx
-        vidx += 1
-
-        corners = []
-        # Define frustum corners at 'far' distance
-        for du in [-0.5, 0.5]: # u ranges from -0.5 to 0.5
-            for dv in [-0.5, 0.5]: # v ranges from -0.5 to 0.5
-                # Direction = cam_dir + u * screen_w * right - v * screen_h * up
-                d = cam_dir + (du * screen_w * right) - (dv * screen_h * up)
-                d /= np.linalg.norm(d) # Normalize
-                corner_pt = cam_o + d * far
-                corners.append(corner_pt)
-                f.write(f"v {corner_pt[0]:.6f} {corner_pt[1]:.6f} {corner_pt[2]:.6f}\n")
-                vidx += 1
-
-        # Indices of the far plane corners (relative to start of frustum vertices)
-        # Order: bottom-left, top-left, bottom-right, top-right (if dv=-0.5 -> bottom)
-        # du=-0.5, dv=-0.5 -> idx 1 (bottom-left)
-        # du=-0.5, dv= 0.5 -> idx 2 (top-left)
-        # du= 0.5, dv=-0.5 -> idx 3 (bottom-right)
-        # du= 0.5, dv= 0.5 -> idx 4 (top-right)
-        bl = cam_v_start + 1
-        tl = cam_v_start + 2
-        br = cam_v_start + 3
-        tr = cam_v_start + 4
-
-        # Lines from camera origin to corners
-        f.write(f"l {cam_v_start} {bl}\n")
-        f.write(f"l {cam_v_start} {tl}\n")
-        f.write(f"l {cam_v_start} {br}\n")
-        f.write(f"l {cam_v_start} {tr}\n")
-        # Lines for the far plane rectangle
-        f.write(f"l {bl} {tl}\n")
-        f.write(f"l {tl} {tr}\n")
-        f.write(f"l {tr} {br}\n")
-        f.write(f"l {br} {bl}\n")
-
-        # Write intersection points (as 'v') and optionally lines from camera ('l')
-        # Writing millions of points/lines can make the OBJ huge and slow to load.
-        # Consider sampling points or only writing points, not lines.
-        f.write('\n# Intersection points (sampled)\n')
-        f.write(f"o intersection_points\n")
-        H, W = pts.shape[:2]
-        step = max(1, H // 64, W // 64) # Sample points to reduce file size
-        point_v_start = vidx
-        num_pts_written = 0
-        for i in range(0, H, step):
-            for j in range(0, W, step):
-                p = pts[i, j]
-                # Check if the point is valid (not NaN)
-                if not np.isnan(p[0]):
-                    f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
-                    # Optional: line from camera to point (makes file huge)
-                    # f.write(f"l {cam_v_start} {vidx}\n")
+            # --- Camera Frustum ---
+            f.write('\n# Camera Frustum\n')
+            f.write('o camera_frustum\n')
+            f.write(f"v {cam_o[0]:.6f} {cam_o[1]:.6f} {cam_o[2]:.6f}\n")
+            cam_v_start = vidx; vidx += 1
+            corners = []
+            for du in [-0.5, 0.5]:
+                for dv in [-0.5, 0.5]:
+                    d_corner = cam_dir + (du * screen_w * right) - (dv * screen_h * up)
+                    d_corner /= np.linalg.norm(d_corner)
+                    corner_pt = cam_o + d_corner * far
+                    corners.append(corner_pt)
+                    f.write(f"v {corner_pt[0]:.6f} {corner_pt[1]:.6f} {corner_pt[2]:.6f}\n")
                     vidx += 1
-                    num_pts_written +=1
+            bl, tl, br, tr = cam_v_start + 1, cam_v_start + 2, cam_v_start + 3, cam_v_start + 4
+            f.write(f"l {cam_v_start} {bl}\n"); f.write(f"l {cam_v_start} {tl}\n")
+            f.write(f"l {cam_v_start} {br}\n"); f.write(f"l {cam_v_start} {tr}\n")
+            f.write(f"l {bl} {tl}\n"); f.write(f"l {tl} {tr}\n")
+            f.write(f"l {tr} {br}\n"); f.write(f"l {br} {bl}\n")
 
-        # Optionally group points if supported by viewer
-        if num_pts_written > 0:
-             f.write(f"g hit_points\n")
-             f.write(f"p {' '.join(map(str, range(point_v_start, vidx)))}\n") # 'p' for point group
+            # --- Intersection Points ---
+            f.write('\n# Intersection Points (Sampled)\n')
+            f.write('o intersection_points\n')
+            H_pts, W_pts = pts.shape[:2] # Use actual shape of pts array
+            step = max(1, H_pts // 64, W_pts // 64)
+            point_v_start = vidx
+            num_pts_written = 0
+            for i in range(0, H_pts, step):
+                for j in range(0, W_pts, step):
+                    p = pts[i, j]
+                    if not np.isnan(p[0]):
+                        f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
+                        vidx += 1
+                        num_pts_written += 1
+            if num_pts_written > 0:
+                 f.write(f"g hit_points\n")
+                 f.write(f"p {' '.join(map(str, range(point_v_start, vidx)))}\n")
+
+        print(f"    成功保存场景、视锥体和 {num_pts_written} 个采样点到 {filename}")
+    except IOError as e:
+        print(f"    错误: 无法写入 OBJ 文件 {filename}: {e}")
+    except Exception as e:
+        print(f"    保存 OBJ 时发生未知错误: {e}")
 
 
-    print(f"    Saved scene, frustum, and {num_pts_written} sampled points to {filename}")
-
-# --- Main Execution Flow --------------------------------------------------
+# --- 主流程 ---
 def main():
-    global _GPU_AVAILABLE # <--- 添加这一行
-
+    global _GPU_AVAILABLE
     total_t0 = _now()
-    # --- Output Directory Setup ---
+
+    # --- 输出目录设置 ---
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     outd = os.path.join('output', ts)
-    os.makedirs(outd, exist_ok=True)
-    print(f"Output directory: {outd}")
-
-    # --- Scene Generation ---
-    print('[1/6] Building scene...')
-    t0 = _now()
-    v0s, e1s, e2s, labels, colors = build_scene()
-    num_triangles = len(v0s)
-    log_step('Scene building', t0)
-    if num_triangles == 0:
-        print("Error: Scene construction resulted in 0 triangles. Exiting.")
+    try:
+        os.makedirs(outd, exist_ok=True)
+        print(f"输出目录: {outd}")
+    except OSError as e:
+        print(f"错误: 无法创建输出目录 {outd}: {e}")
         return
-    print(f"    Scene contains {num_triangles} triangles.")
 
-    # --- Camera Setup ---
-    print('[2/6] Setting up camera...')
-    # Use global scope variables carefully; passing as arguments is often clearer
-    # For simplicity here, we keep the global approach from the original code
-    # global cam_o, cam_dir, right, up, screen_w, screen_h
+    # --- 场景生成 ---
+    print('[1/7] 构建场景...')
     t0 = _now()
-    cam_o = np.array([-30, 20, -85], dtype=GEOMETRY_DTYPE) # Adjusted Z slightly
-    cam_t = np.array([20, 10, 0], dtype=GEOMETRY_DTYPE)  # Look more towards center/lower
-    cam_up_vec = np.array([0, 1, 0], dtype=GEOMETRY_DTYPE) # World up vector
+    v0s, e1s, e2s, labels, colors, prim_indices = build_scene()
+    num_triangles = len(v0s)
+    log_step('场景构建', t0)
+    if num_triangles == 0:
+        print("错误: 场景构建结果为 0 个三角形。正在退出。")
+        return
+    print(f"    场景包含 {num_triangles} 个三角形。")
+
+    # --- 构建 BVH ---
+    print('[2/7] 构建 BVH...')
+    t0 = _now()
+    flat_nodes, ordered_prim_indices = build_bvh(v0s, e1s, e2s, prim_indices)
+    log_step('BVH 构建', t0)
+
+    # --- Reorder Geometry Data Based on BVH ---
+    print('[3/7] 根据 BVH 重新排序几何数据...')
+    t0 = _now()
+    if len(ordered_prim_indices) != num_triangles:
+        print(f"错误: BVH 返回的索引数量 ({len(ordered_prim_indices)}) 与三角形数量 ({num_triangles}) 不匹配。")
+        v0s_reordered = v0s; e1s_reordered = e1s; e2s_reordered = e2s
+        labels_reordered = labels; colors_reordered = colors
+        print("    警告: 使用原始几何数据顺序进行光线追踪。")
+    else:
+        try:
+            v0s_reordered = v0s[ordered_prim_indices]
+            e1s_reordered = e1s[ordered_prim_indices]
+            e2s_reordered = e2s[ordered_prim_indices]
+            labels_reordered = labels[ordered_prim_indices]
+            colors_reordered = colors[ordered_prim_indices]
+        except IndexError as e:
+             print(f"错误: 使用 ordered_prim_indices 重新排序几何数据时发生索引错误: {e}")
+             print("    警告: 使用原始几何数据顺序进行光线追踪。")
+             v0s_reordered = v0s; e1s_reordered = e1s; e2s_reordered = e2s
+             labels_reordered = labels; colors_reordered = colors
+
+    log_step('几何数据重新排序', t0)
+
+    # --- 相机设置 ---
+    print('[4/7] 设置相机...')
+    t0 = _now()
+    # *** MODIFICATION: New Camera Position and Target ***
+    # cam_o = np.array([-70, 40, -120], dtype=GEOMETRY_DTYPE) # Old position
+    # cam_t = np.array([10, 5, 0], dtype=GEOMETRY_DTYPE)    # Old target
+    cam_o = np.array([-50, 100, -180], dtype=GEOMETRY_DTYPE) # Higher, further back, less side angle
+    cam_t = np.array([20, 10, 80], dtype=GEOMETRY_DTYPE)    # Target towards lake/mountains
+    # *** END MODIFICATION ***
+
+    cam_up_vec = np.array([0, 1, 0], dtype=GEOMETRY_DTYPE)
 
     cam_dir = cam_t - cam_o
-    cam_dir /= np.linalg.norm(cam_dir)
+    norm_cam_dir = np.linalg.norm(cam_dir)
+    if norm_cam_dir < EPSILON: print("错误: 相机位置和目标点重合。"); return
+    cam_dir /= norm_cam_dir
 
     right = np.cross(cam_dir, cam_up_vec)
-    # Handle case where cam_dir is aligned with cam_up_vec (looking straight up/down)
-    if np.linalg.norm(right) < 1e-6:
-        # If looking straight up/down, 'right' could be arbitrary (e.g., world X)
-        # Recompute 'up' accordingly
-        print("Warning: Camera looking straight up/down. Adjusting right vector.")
-        right = np.array([1, 0, 0], dtype=GEOMETRY_DTYPE) # Assume world X is right
-        # Ensure cam_up is orthogonal to new cam_dir
-        cam_dir_flat = np.array([cam_dir[0], 0, cam_dir[2]], dtype=GEOMETRY_DTYPE)
-        if np.linalg.norm(cam_dir_flat) > 1e-6: # If not perfectly vertical
-            cam_dir_flat /= np.linalg.norm(cam_dir_flat)
-            right = np.cross(cam_dir, cam_up_vec) # Re-calculate based on non-vertical part
-            right /= np.linalg.norm(right)
-            up = np.cross(right, cam_dir) # Recalculate up based on right/dir
-        else: # Perfectly vertical view
-            up = np.cross(right, cam_dir) # Up will be orthogonal to right and dir
-    else:
-        right /= np.linalg.norm(right)
-        up = np.cross(right, cam_dir) # Recalculate up to ensure orthogonality
-        # No need to normalize 'up' if 'right' and 'cam_dir' are normalized unit vectors
+    norm_right = np.linalg.norm(right)
+    if norm_right < EPSILON:
+        print("警告: 相机方向与向上向量平行。调整右向量。")
+        if abs(cam_dir[1]) > 1.0 - EPSILON: right = np.cross(np.array([0, 0, 1.0], dtype=GEOMETRY_DTYPE), cam_dir)
+        else: right = np.array([1, 0, 0], dtype=GEOMETRY_DTYPE)
+        norm_right = np.linalg.norm(right)
+    right /= norm_right
+    up = np.cross(right, cam_dir)
 
-    # Image dimensions
-    W, H = 2048, 1024
-    # Field of View (Vertical FOV)
-    fov_degrees = 60.0
+    W, H = 1920, 1080
+    fov_degrees = 65.0 # Slightly narrower FoV might be better for distant view
     fov_radians = np.deg2rad(fov_degrees)
-
-    # Screen height in world space at distance 1 from camera
-    # tan(fov_rad / 2) = (screen_h / 2) / 1 => screen_h = 2 * tan(fov_rad / 2)
-    screen_h = GEOMETRY_DTYPE(2.0 * np.tan(fov_radians / 2.0))
-    # Screen width based on aspect ratio
     aspect_ratio = W / H
+    screen_h = GEOMETRY_DTYPE(2.0 * np.tan(fov_radians / 2.0))
     screen_w = GEOMETRY_DTYPE(screen_h * aspect_ratio)
 
-    log_step('Camera setup', t0)
-    print(f"    Resolution: {W}x{H}, FoV: {fov_degrees} deg")
-    print(f"    Cam Pos: {cam_o}, Target: {cam_t}")
-    print(f"    Cam Dir: {cam_dir}")
-    print(f"    Cam Right: {right}")
-    print(f"    Cam Up: {up}")
+    log_step('相机设置', t0)
+    print(f"    分辨率: {W}x{H}, FoV: {fov_degrees} deg")
+    print(f"    相机位置: [{cam_o[0]:.2f}, {cam_o[1]:.2f}, {cam_o[2]:.2f}]")
+    print(f"    相机目标: [{cam_t[0]:.2f}, {cam_t[1]:.2f}, {cam_t[2]:.2f}]")
 
-    # --- Ray Tracing ---
-    print('[3/6] Ray tracing...')
-    t0 = _now()
-    rgb, depth, sem_lbl, pts = None, None, None, None # Initialize results
 
-    if _GPU_AVAILABLE:
-        print("    Using GPU (CUDA)...")
+    # --- 光线追踪 ---
+    print('[5/7] 光线追踪...')
+    t0_raytrace = _now()
+    rgb, depth, sem_lbl, pts = None, None, None, None
+    use_gpu = _GPU_AVAILABLE and flat_nodes.shape[0] > 0
+
+    # --- Remove forced CPU for normal execution ---
+    # print("---!! 强制使用 CPU 进行调试 !! ---")
+    # use_gpu = False
+    # ---
+
+    if use_gpu:
+        print("    尝试使用 GPU (CUDA + BVH)...")
         try:
-            # --- Prepare Data for GPU ---
             t_upload_start = _now()
-            # Scene Geometry (already numpy arrays with correct dtype)
-            d_v0s    = cuda.to_device(v0s)
-            d_e1s    = cuda.to_device(e1s)
-            d_e2s    = cuda.to_device(e2s)
-            d_labels = cuda.to_device(labels)
-            d_colors = cuda.to_device(colors)
-
-            # Camera Parameters (copy individual vectors/scalars)
+            # --- Upload Data to GPU ---
+            d_flat_nodes = cuda.to_device(flat_nodes)
+            d_v0s    = cuda.to_device(v0s_reordered)
+            d_e1s    = cuda.to_device(e1s_reordered)
+            d_e2s    = cuda.to_device(e2s_reordered)
+            d_labels = cuda.to_device(labels_reordered)
+            d_colors = cuda.to_device(colors_reordered)
             d_cam_o   = cuda.to_device(cam_o)
             d_cam_dir = cuda.to_device(cam_dir)
             d_right   = cuda.to_device(right)
             d_up      = cuda.to_device(up)
 
-            # Output Buffers (allocate on GPU)
+            # Output buffers (initialize on GPU)
             d_rgb    = cuda.device_array((H, W, 3), dtype=COLOR_DTYPE)
-            d_depth  = cuda.device_array((H, W), dtype=DEPTH_DTYPE)
-            d_sem    = cuda.device_array((H, W), dtype=LABEL_DTYPE)
-            d_pts    = cuda.device_array((H, W, 3), dtype=POINT_DTYPE)
-            # Initialize depth and points on GPU? Usually done implicitly or via kernel logic.
-            # We handle non-hits within the kernel.
-            log_step('GPU data upload', t_upload_start)
+            depth_init_host = np.full((H, W), INF, dtype=DEPTH_DTYPE)
+            d_depth  = cuda.to_device(depth_init_host)
+            sem_init_host = np.zeros((H, W), dtype=LABEL_DTYPE)
+            d_sem    = cuda.to_device(sem_init_host)
+            pts_init_host = np.full((H, W, 3), np.nan, dtype=POINT_DTYPE)
+            d_pts    = cuda.to_device(pts_init_host)
+            log_step('GPU 数据上传', t_upload_start)
 
-            # --- Kernel Launch Configuration ---
-            # Try adjusting threads per block
-            threads_per_block = (16, 16) # Common starting point (256 threads/block)
-            # threads_per_block = (32, 32) # Max threads per block (1024), potentially faster if registers allow
-            # threads_per_block = (8, 8)   # Smaller block size (64 threads/block)
-
+            # --- Kernel Launch ---
+            threads_per_block = (16, 16)
             blocks_per_grid_x = (W + threads_per_block[1] - 1) // threads_per_block[1]
             blocks_per_grid_y = (H + threads_per_block[0] - 1) // threads_per_block[0]
-            blocks_per_grid = (blocks_per_grid_y, blocks_per_grid_x) # Order is (Y, X) or (i, j)
+            blocks_per_grid = (blocks_per_grid_y, blocks_per_grid_x)
+            print(f"    启动 CUDA 内核: Grid={blocks_per_grid}, Block={threads_per_block}")
 
-            print(f"    Launching CUDA kernel with {blocks_per_grid} blocks, {threads_per_block} threads/block")
-
-            # --- Execute Kernel ---
             t_kernel_start = _now()
-            raytrace_cuda_kernel[blocks_per_grid, threads_per_block](
-                d_v0s, d_e1s, d_e2s, d_labels, d_colors, # Geometry
-                d_cam_o, d_cam_dir, d_right, d_up,       # Camera
-                GEOMETRY_DTYPE(screen_w), GEOMETRY_DTYPE(screen_h), # Screen params (pass as value)
-                np.int32(W), np.int32(H),                # Dimensions (pass as value)
-                d_rgb, d_depth, d_sem, d_pts)            # Output buffers
-            cuda.synchronize() # Wait for kernel to finish before proceeding
-            log_step('GPU kernel execution', t_kernel_start)
+            raytrace_cuda_bvh_kernel[blocks_per_grid, threads_per_block](
+                d_flat_nodes, d_v0s, d_e1s, d_e2s, d_labels, d_colors,
+                d_cam_o, d_cam_dir, d_right, d_up,
+                screen_w, screen_h, W, H,
+                d_rgb, d_depth, d_sem, d_pts
+            )
+            cuda.synchronize()
+            log_step('GPU BVH 内核执行', t_kernel_start)
 
-            # --- Download Results from GPU ---
+            # --- Download Results ---
             t_download_start = _now()
             rgb     = d_rgb.copy_to_host()
             depth   = d_depth.copy_to_host()
             sem_lbl = d_sem.copy_to_host()
             pts     = d_pts.copy_to_host()
-            log_step('GPU data download', t_download_start)
+            log_step('GPU 数据下载', t_download_start)
+            print("    GPU 执行成功。")
 
+        except cuda.cudadrv.driver.CudaAPIError as e:
+            print(f"\n---!! CUDA API 错误: {e} !!---")
+            print("---!! 可能是显存不足或驱动问题。回退到 CPU 执行。 !!---\n")
+            _GPU_AVAILABLE = False; use_gpu = False
+        except AttributeError as e:
+             if "'float' object has no attribute 'view'" in str(e) or \
+                "'DeviceFunctionTemplate' object has no attribute 'view'" in str(e):
+                 print(f"\n---!! GPU 错误: {e} !!---")
+                 print("---!! Numba CUDA 的 .view() 用法可能存在问题或版本不兼容。回退到 CPU。 !!---\n")
+             else:
+                 print(f"\n---!! GPU 执行期间发生属性错误: {e} !!---")
+                 print("---!! 回退到 CPU 执行。 !!---\n")
+             _GPU_AVAILABLE = False; use_gpu = False
         except Exception as e:
-            print(f"\n---!! GPU execution failed: {e} !!---")
-            print("---!! Falling back to CPU execution. !!---\n")
-            _GPU_AVAILABLE = False # Prevent further GPU attempts
+            print(f"\n---!! GPU 执行期间发生未知错误: {e} !!---")
+            print(f"---!! 错误类型: {type(e).__name__}")
+            print("---!! 回退到 CPU 执行。 !!---\n")
+            _GPU_AVAILABLE = False; use_gpu = False
 
-    # --- CPU Execution (Fallback or if no GPU) ---
-    if not _GPU_AVAILABLE:
-        print("    Using CPU (Numba JIT)...")
+    # --- CPU Execution ---
+    if not use_gpu:
+        print("    使用 CPU (Numba JIT + BVH)...")
         t_cpu_start = _now()
-        # Pass screen parameters and dimensions explicitly
-        rgb, depth, sem_lbl, pts = raytrace_cpu(
-            v0s, e1s, e2s, labels, colors,
+        # Ensure parallel execution is enabled for performance
+        print("    注意: CPU 使用并行计算。")
+        rgb, depth, sem_lbl, pts = raytrace_cpu_bvh(
+            flat_nodes, v0s_reordered, e1s_reordered, e2s_reordered,
+            labels_reordered, colors_reordered,
             cam_o, cam_dir, right, up,
-            screen_w, screen_h, W, H)
-        log_step('CPU raytrace execution', t_cpu_start)
+            screen_w, screen_h, W, H
+        )
+        log_step('CPU BVH 光线追踪执行', t_cpu_start)
 
-    log_step('Total ray tracing', t0) # Log total time for the section
+    log_step('总光线追踪', t0_raytrace)
 
-    # --- Image Export ---
-    print('[4/6] Saving output images...')
-    t0 = _now()
+    # --- 图像导出 ---
+    print('[6/7] 保存输出图像...')
+    t0_save = _now()
     if rgb is not None:
         fn_view = os.path.join(outd, f'view_{ts}.png')
-        Image.fromarray(rgb).save(fn_view)
-        print(f"    Saved view: {fn_view}")
-    else:
-        print("    Skipping view saving (ray tracing failed?).")
+        try:
+            Image.fromarray(rgb).save(fn_view)
+            print(f"    已保存视图: {fn_view}")
+        except Exception as e: print(f"    错误: 保存视图图像失败: {e}")
+    else: print("    跳过视图保存 (无 RGB 数据).")
 
     if depth is not None:
         fn_depth = os.path.join(outd, f'depth_{ts}.png')
-        # Normalize depth map for visualization (handle potential inf values)
-        valid_depth = depth[np.isfinite(depth)]
-        if len(valid_depth) > 0:
-            dmin, dmax = np.min(valid_depth), np.max(valid_depth)
-            print(f"    Depth range (finite): {dmin:.2f} to {dmax:.2f}")
-            # Clamp depth for visualization if max is too large
-            vis_dmax = min(dmax, 300.0) # Clamp visualization max depth if needed
-            # Normalize to 0-254, use 255 for infinite/no hit
-            dmap = np.where(np.isfinite(depth),
-                            np.clip((depth - dmin) / (vis_dmax - dmin + 1e-6) * 254, 0, 254),
-                            255).astype(np.uint8)
-            Image.fromarray(dmap, 'L').save(fn_depth)
-            print(f"    Saved depth map: {fn_depth}")
-        else:
-            print("    Skipping depth saving (no valid depth values).")
-            # Create a black image as placeholder?
-            Image.new('L', (W, H), 0).save(fn_depth)
+        try:
+            valid_depth = depth[np.isfinite(depth)]
+            if len(valid_depth) > 0:
+                dmin = np.min(valid_depth)
+                dmax_vis = np.percentile(valid_depth, 99.5)
+                dmax_vis = min(dmax_vis, 600.0)
+                print(f"    深度范围 (有限值): {dmin:.2f} 到 {np.max(valid_depth):.2f} (可视化上限: {dmax_vis:.2f})")
+                if dmax_vis <= dmin: dmax_vis = dmin + 1.0
 
+                scale = (dmax_vis - dmin)
+                if scale < EPSILON: scale = EPSILON
+                depth_normalized = (depth - dmin) / scale
+
+                depth_clipped = np.clip(depth_normalized * 254, 0, 254)
+                dmap = np.where(np.isfinite(depth), depth_clipped, 255).astype(np.uint8)
+
+                Image.fromarray(dmap, 'L').save(fn_depth)
+                print(f"    已保存深度图: {fn_depth}")
+            else:
+                print("    跳过深度图保存 (无有效深度值).")
+                Image.new('L', (W, H), 0).save(fn_depth) # Save black image
+        except RuntimeWarning as e:
+             print(f"    保存深度图时发生运行时警告: {e}")
+             print(f"    这通常发生在所有深度值都是 INF 时。")
+             try: Image.new('L', (W, H), 0).save(fn_depth)
+             except: pass
+        except Exception as e: print(f"    错误: 保存深度图像失败: {e}")
+    else: print("    跳过深度图保存 (无深度数据).")
 
     if sem_lbl is not None:
         fn_sem = os.path.join(outd, f'semantic_{ts}.png')
-        # Create color palette matching the scene build colors + background
-        palette = {
-            0: (0, 0, 0),            # Background/Default
-            1: C[1].tolist(),        # Building
-            2: C[2].tolist(),        # Road
-            3: C[3].tolist(),        # Water
-            4: C[4].tolist(),        # Skyscraper/Special
-            5: C[5].tolist(),        # Tree
-            6: C[6].tolist()         # Mountain
-            # Add other labels if used
-        }
-        # Create RGB image from labels and palette
-        sem_img = np.zeros_like(rgb, dtype=COLOR_DTYPE) # Use COLOR_DTYPE
-        for label_id, color in palette.items():
-            mask = (sem_lbl == label_id)
-            sem_img[mask] = color
-        Image.fromarray(sem_img).save(fn_sem)
-        print(f"    Saved semantic map: {fn_sem}")
-    else:
-         print("    Skipping semantic map saving (ray tracing failed?).")
+        try:
+            palette = {label: color_array.tolist() for label, color_array in C.items()}
+            palette[0] = PALETTE_BACKGROUND_COLOR
+            sem_img = np.zeros((H, W, 3), dtype=COLOR_DTYPE)
+            unique_labels = np.unique(sem_lbl)
+            for label_id in unique_labels:
+                 if label_id in palette:
+                     mask = (sem_lbl == label_id)
+                     sem_img[mask] = palette[label_id]
+            Image.fromarray(sem_img).save(fn_sem)
+            print(f"    已保存语义图: {fn_sem}")
+        except Exception as e: print(f"    错误: 保存语义图像失败: {e}")
+    else: print("    跳过语义图保存 (无语义数据).")
 
-    log_step('Image export', t0)
+    log_step('图像导出', t0_save)
 
-    # --- OBJ Export ---
-    print('[5/6] Saving combined OBJ file...')
-    t0 = _now()
+    # --- OBJ 导出 ---
+    print('[7/7] 保存组合 OBJ 文件...')
+    t0_obj = _now()
     fn_obj = os.path.join(outd, f'combined_{ts}.obj')
-    # Determine a suitable 'far' distance for the frustum visualization
-    far_dist = 150.0 # Default far distance
+    far_dist = 350.0
     if depth is not None:
         valid_depth = depth[np.isfinite(depth)]
-        if len(valid_depth) > 0:
-            far_dist = max(far_dist, np.max(valid_depth) * 1.1) # Extend beyond max hit
+        if len(valid_depth) > 0: far_dist = max(far_dist, np.max(valid_depth) * 1.1)
 
     if pts is not None:
          save_combined_obj(fn_obj, v0s, e1s, e2s,
-                           cam_o, cam_dir, right, up, screen_w, screen_h, # Pass screen params
+                           cam_o, cam_dir, right, up, screen_w, screen_h,
                            pts, far=far_dist)
-    else:
-         print("    Skipping OBJ saving (ray tracing failed?).")
+    else: print("    跳过 OBJ 保存 (无交点数据).")
+    log_step('OBJ 导出', t0_obj)
 
-    log_step('OBJ export', t0)
-
-    # --- Completion ---
-    print('[6/6] Finished.')
+    # --- 完成 ---
+    print('\n[完成]')
     total_time = _now() - total_t0
-    print(f"Total execution time: {total_time:.2f}s")
-    print(f"Output saved to: {outd}")
+    print(f"总执行时间: {total_time:.2f}s")
+    print(f"输出已保存至: {outd}")
 
 
 if __name__ == '__main__':
