@@ -462,7 +462,7 @@ def main():
     right = np.cross(cam_dir, cam_up); right /= np.linalg.norm(right)
     up = np.cross(right, cam_dir)
 
-    W, H = 1024, 512
+    W, H = 2048, 1024
     fov = np.deg2rad(60)
     screen_h = 2 * np.tan(fov / 2)
     screen_w = screen_h * (W / H)
