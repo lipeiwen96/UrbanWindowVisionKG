@@ -5,5 +5,8 @@ from art_public_modules.art_data_exchange.data_exchange import ARTShapelyDataExc
 file_path = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\processed\project\project_simplified_only_crv.3dm"
 dm = ARTShapelyDataExchanger.read_rhino_file(file_path)
 print(len(dm.elements))
-for ele in dm.elements:
-    print(f"图层：{ele.layer}, 面积：{round(ele.geometry.area, 2)}, 高度: {round(ele.height, 2)}")
+# for ele in dm.elements:
+#     print(f"图层：{ele.layer}, 面积：{round(ele.geometry.area, 2)}, 高度: {round(ele.height, 2)}")
+
+json_path = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\processed\project\project_simplified_only_crv.json"
+dm = ARTShapelyDataExchanger.write_json_file(json_path, dm)

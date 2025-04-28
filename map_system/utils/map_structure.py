@@ -85,6 +85,18 @@ class MapBuilding(MapBaseGeometry):
         self.official_building_name_tc = p.get("OFFICIALBUILDINGNAMETC", "")
         self.num_above_ground_storeys = p.get("NUMABOVEGROUNDSTOREYS", 0)
 
+    @property
+    def to_dict(self):
+        return {
+            "object_id": self.object_id,
+            "building_structure_id": self.building_structure_id,
+            "status": self.status,
+            "category": self.category,
+            "official_building_name_en": self.official_building_name_en,
+            "official_building_name_tc": self.official_building_name_tc,
+            "num_above_ground_storeys": self.num_above_ground_storeys,
+        }
+
 
 @dataclass
 class MapLot(MapBaseGeometry):
@@ -120,6 +132,18 @@ class MapLot(MapBaseGeometry):
         else:
             raise Exception(f"地块数据读取失败，地块object_id: {row_data['properties']['OBJECTID']}, 地块坐标{row_data['geometry']['coordinates']}")
 
+    @property
+    def to_dict(self):
+        return {
+            "object_id": self.object_id,
+            "is_GLA": self.is_GLA,
+            "lot_id": self.lot_id,
+            "lot_csu_id": self.lot_csu_id,
+            "gla_id": self.gla_id,
+            "gla_code": self.gla_code,
+            "gla_number": self.gla_number,
+        }
+
 
 @dataclass
 class MapRoadPolygon(MapBaseGeometry):
@@ -139,6 +163,13 @@ class MapRoadPolygon(MapBaseGeometry):
             self.feat_type = row_data['properties']['FEAT_TYPE']
         else:
             raise Exception(f"道路图形数据读取失败，道路object_id: {row_data['properties']['OBJECTID']}, 道路坐标{row_data['geometry']['coordinates']}")
+
+    @property
+    def to_dict(self):
+        return {
+            "object_id": self.object_id,
+            "feat_type": self.feat_type,
+        }
 
 
 @dataclass

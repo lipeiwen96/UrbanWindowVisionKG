@@ -36,19 +36,19 @@ class JsonFileWriter:
             cur_element['element_height'] = element.height
             cur_element['element_start_height'] = element.start_height
 
-            material = {}
-            material['element_diffuse'] = element.material.diffuse
-            material['element_diffuse_opacity'] = element.material.diffuse_opacity
-            material['element_is_outline'] = element.material.is_outline
-            material['element_outline_color'] = element.material.outline_color
-            material['element_outline_opacity'] = element.material.outline_opacity
-            material['element_outline_width'] = element.material.outline_width
-            material['element_outline_type'] = element.material.outline_type
-            material['element_texture_pic'] = element.material.texture_pic
-            material['element_texture_scale'] = element.material.texture_scale
-            material['element_texture_rotate'] = element.material.texture_rotate
-            material['element_effect_type'] = element.material.effect_type
-            cur_element['material'] = material
+            # material = {}
+            # material['element_diffuse'] = element.material.diffuse
+            # material['element_diffuse_opacity'] = element.material.diffuse_opacity
+            # material['element_is_outline'] = element.material.is_outline
+            # material['element_outline_color'] = element.material.outline_color
+            # material['element_outline_opacity'] = element.material.outline_opacity
+            # material['element_outline_width'] = element.material.outline_width
+            # material['element_outline_type'] = element.material.outline_type
+            # material['element_texture_pic'] = element.material.texture_pic
+            # material['element_texture_scale'] = element.material.texture_scale
+            # material['element_texture_rotate'] = element.material.texture_rotate
+            # material['element_effect_type'] = element.material.effect_type
+            # cur_element['material'] = material
 
             cur_element['element_custom_semantics'] = element.custom_semantics
             data_model_dict['model_elements'].append(cur_element)

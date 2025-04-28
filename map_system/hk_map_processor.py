@@ -251,7 +251,7 @@ class MapProcessor:
             print("\n--- 步骤 6: 跳过数据分析与绘图 ---") # 步骤编号更新
 
         print("\n--- 步骤 7: 导出为 3DM 文件 ---") # 步骤编号更新
-        self._export_3dm()
+        self._export_model()
         print("--- 3DM 文件导出完成 ---")
         print("\n=== 地图处理流程执行完毕 ===")
 
@@ -638,8 +638,9 @@ class MapProcessor:
 
 
     # ---------- 导出方法 ----------
-    def _export_3dm(self):
+    def _export_model(self):
         """将加载和处理后的建筑、地块、道路、行政区、绿地数据导出为 Rhino 3DM 文件。"""
+        # TODO: 将语义信息存入datamodel
         print(f"  准备用于 Rhino 导出的数据模型...")
         model = DataModel(name="地图模型")
 
@@ -658,7 +659,7 @@ class MapProcessor:
             try:
                 layer_name = "GLA" if getattr(lot, 'is_GLA', False) else "LOT"
                 model.insert_element(DataElement(
-                    lot.geometry, layer=layer_name, start_height=-5, height=5.2))
+                    lot.geometry, layer=layer_name, start_height=-5, height=5.2, custom_semantics=lot.to_dict))
                 lot_count += 1
             except Exception as e:
                 lot_id_str = getattr(lot, 'lot_id', getattr(lot, 'gla_id', '未知ID'))
@@ -671,7 +672,7 @@ class MapProcessor:
         for road in self.roads:
             try:
                 model.insert_element(DataElement(
-                    road.geometry, layer="ROAD", start_height=-5, height=5.0)) # 道路略高于地块
+                    road.geometry, layer="ROAD", start_height=-5, height=5.0, custom_semantics=road.to_dict)) # 道路略高于地块
                 road_count += 1
             except Exception as e:
                 road_id_str = getattr(road, 'object_id', '未知ID')
@@ -713,8 +714,7 @@ class MapProcessor:
         for b in self.buildings:
             try:
                 model.insert_element(DataElement(
-                    b.geometry, layer=f"Building",
-                    start_height=b.start_height, height=b.height))
+                    b.geometry, layer=f"Building", start_height=b.start_height, height=b.height, custom_semantics=b.to_dict))
                 building_count += 1
             except Exception as e:
                  bldg_id_str = getattr(b, 'object_id', '未知ID')
@@ -725,7 +725,7 @@ class MapProcessor:
         model.renew()
 
         model_path = self.out / "map_model.3dm"
-        json_path = self.out / "map_model_json.3dm"
+        json_path = self.out / "map_model.json"
         print(f"  正在将 Rhino 3DM  / json 文件写入到: {model_path}")
         try:
             ARTShapelyDataExchanger.write_rhino_file(str(model_path), model)
