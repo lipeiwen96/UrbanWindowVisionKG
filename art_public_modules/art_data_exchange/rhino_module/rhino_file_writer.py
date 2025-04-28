@@ -138,7 +138,6 @@ class RhinoFileWriter:
                 cur_object = self.doc.Objects.FindId(str(object_id))
                 cur_object.Attributes.LayerIndex = layer_index[0]
 
-
         # 创建树冠
         # print("Generating Tree... 正在生成景观树")
         # for element in data_model.elements:
@@ -148,8 +147,6 @@ class RhinoFileWriter:
         #         tree_obj = self.doc.Objects.FindId(str(tree_id))
         #         tree_obj.Attributes.LayerIndex = self.__find_layer_index_by_layer_name("XKOOL_Gen_Trees")
         # print("Generating Successfully！景观树生成成功！")
-
-
 
         # 创建文字标注
         if "solution_text" in data_model.user_data.keys():

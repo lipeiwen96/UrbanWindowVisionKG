@@ -1,173 +1,198 @@
-# map_cropper.py (Optimized)
 import copy
-from typing import List, Optional
+from typing import List, Optional, Union, Tuple
 
-# 明确导入需要的 Shapely 类型
-from shapely.geometry import Polygon, LineString, MultiPolygon, MultiLineString, GeometryCollection
-from shapely.geometry.base import BaseGeometry
-from shapely.validation import make_valid # 用于更可靠地修复无效几何
-
-# 假设这个导入路径是正确的
-from map_system.map_structure import MapBaseGeometry
+# 明确导入需要的 Shapely 类型和基础类
+from shapely.geometry import Polygon, LineString, MultiPolygon, MultiLineString, GeometryCollection, box
+from shapely.geometry.base import BaseGeometry, GEOSException
+from shapely.validation import make_valid
+from shapely.ops import transform # 用于可能的坐标转换 (如果需要)
 
 
-class MapCropper:
+class RobustMapCropper:
     """
-    提供将地图几何对象列表高效裁剪到指定边界框的功能。
-    - 完全在内部的几何体直接保留。
-    - 完全在外部的几何体直接丢弃。
-    - 仅对与边界相交的几何体执行裁剪操作。
+    提供将单个任意 Shapely 几何图形裁剪到指定边界框的功能，
+    并返回分解后的有效基础几何图形列表。
     """
 
     @staticmethod
-    def clip_to_box(map_geometry_list: List[MapBaseGeometry], clip_box: Polygon) -> List[MapBaseGeometry]:
+    def clip_geometry(
+        input_geometry: Optional[BaseGeometry],
+        clip_box: Polygon,
+        filter_threshold: Optional[float] = 1e-9 # 设置阈值过滤小碎片，None 则不过滤
+        ) -> List[Union[Polygon, LineString]]:
         """
-        将地图几何对象列表高效裁剪到指定的 clip_box 边界内。
+        将单个输入几何图形裁剪到指定的 clip_box 边界内，并返回有效的基础几何图形列表。
 
         Args:
-            map_geometry_list: 包含 MapBaseGeometry 对象的列表。
+            input_geometry: 输入的 Shapely 几何对象 (可以是任何类型)。
             clip_box: 用于裁剪的 Shapely Polygon 对象。
+            filter_threshold: 用于过滤微小几何体的阈值 (面积或长度)。
+                              设置为 None 则不过滤。默认为 1e-9。
 
         Returns:
-            一个新的列表，包含处理后的 MapBaseGeometry 对象。
+            一个列表，包含裁剪后有效的、非空的 Polygon 和 LineString 对象。
+            如果输入无效、裁剪出错或无有效交集，则返回空列表 []。
         """
-        clipped_results: List[MapBaseGeometry] = []
+        # 1. 验证输入
+        if input_geometry is None or input_geometry.is_empty:
+            print("Warning: Input geometry is None or empty.")
+            return []
+        if clip_box is None or clip_box.is_empty or not isinstance(clip_box, Polygon):
+             print("Error: Clip box is None, empty, or not a Polygon.")
+             return []
 
-        # 预先检查 clip_box 是否有效
-        if not clip_box.is_valid:
-            # 尝试修复 clip_box，如果失败则无法进行裁剪
-            clip_box = make_valid(clip_box)
-            if not isinstance(clip_box, Polygon): # make_valid 可能返回 MultiPolygon 等
-                # Handle error: Cannot proceed with invalid clip_box
-                return [] # Return empty list or raise error
+        # 2. 确保几何体有效性 (尝试修复)
+        valid_input_geom = RobustMapCropper._ensure_valid(input_geometry)
+        valid_clip_box = RobustMapCropper._ensure_valid(clip_box)
 
-        for map_geo in map_geometry_list:
-            geom = map_geo.geometry
-            if geom is None or geom.is_empty:
-                continue
+        # 如果修复失败或类型不符
+        if valid_input_geom is None:
+            print("Warning: Input geometry is invalid and could not be fixed.")
+            return []
+        if not isinstance(valid_clip_box, Polygon):
+             print("Error: Clip box became invalid after attempting to fix.")
+             return [] # 必须是 Polygon 才能裁剪
 
-            # 尝试修复输入几何体
-            if not geom.is_valid:
-                geom = make_valid(geom)
-                # 如果修复后变成空的或非预期类型，则跳过
-                if geom.is_empty or not isinstance(geom, (Polygon, LineString, MultiPolygon, MultiLineString, GeometryCollection)):
-                     continue
-                # 更新 map_geo 中的几何体引用，以便后续操作使用修复后的版本
-                # 注意：这里直接修改可能影响原始列表，如果需要保持原始列表不变，应在开始时深拷贝
-                map_geo.geometry = geom # Or handle this via deepcopy later
-
-            # --- Optimization Logic ---
-            # Case 1: 完全包含在 clip_box 内?
-            # 使用 prepared geometry 可以加速 contains/intersects 判断，但对少量判断可能开销更大
-            # prep_clip_box = prep(clip_box) # 如果 clip_box 固定且检查次数多，可以考虑
-            try:
-                if clip_box.contains(geom):
-                    # 完全在内部，直接添加深拷贝
-                    clipped_results.append(copy.deepcopy(map_geo))
-                    continue # 处理下一个几何体
-            except Exception:
-                # contains 操作也可能因拓扑错误失败
-                # Fallback to intersection logic below
-                pass # Let it proceed to intersects check
-
-            # Case 2: 与 clip_box 相交? (排除了完全包含的情况)
-            try:
-                if geom.intersects(clip_box):
-                    # 与边界相交，执行裁剪
-                    intersection_outcomes = MapCropper.single_geometry_intersection(map_geo, geom, clip_box) # 传入修复后的 geom
-                    if intersection_outcomes:
-                        clipped_results.extend(intersection_outcomes)
-                # else: Case 3: 完全在外部，自动忽略，不添加到 clipped_results
-            except Exception:
-                # intersects 操作也可能失败
-                continue # Skip this geometry if intersects check fails
-
-        return clipped_results
-
-    @staticmethod
-    def single_geometry_intersection(
-        original_map_geo: MapBaseGeometry,
-        valid_geometry: BaseGeometry, # 传入已经验证/修复过的几何体
-        clip_box: Polygon
-        ) -> Optional[List[MapBaseGeometry]]:
-        """
-        计算单个几何体与 clip_box 的交集 (假设已经检查过 intersects)。
-
-        Args:
-            original_map_geo: 原始的 MapBaseGeometry 对象 (用于深拷贝属性)。
-            valid_geometry: 已经验证/修复过的 Shapely 几何体。
-            clip_box: 用于裁剪的 Shapely Polygon 对象。
-
-        Returns:
-            如果存在有效交集，则返回包含一个或多个裁剪后 MapBaseGeometry 对象的列表。
-            否则返回 None。
-        """
+        # 3. 计算交集 (使用 try-except 捕获 GEOS 错误)
         try:
-            # 直接执行交集计算，因为已确认相交且几何体有效
-            outcome = valid_geometry.intersection(clip_box)
-        except Exception:
-            # Intersection 仍然可能失败
-            return None
+            # 只有当输入几何图形与边界框可能相交时才进行实际计算
+            if not valid_input_geom.disjoint(valid_clip_box):
+                intersection_result = valid_input_geom.intersection(valid_clip_box)
+            else:
+                # 如果不相交，则结果为空
+                return []
+        except GEOSException as e:
+            print(f"Error during intersection: {e}. Skipping geometry.")
+            return []
+        except Exception as e:
+            print(f"Unexpected error during intersection: {e}. Skipping geometry.")
+            return []
 
-        # 处理交集结果
-        processed_geometries = MapCropper.outcome_process(outcome)
+        # 4. 处理并分解交集结果
+        final_geometries = RobustMapCropper._flatten_and_validate(intersection_result, filter_threshold)
 
-        # 如果处理后得到有效几何列表
-        if processed_geometries:
-            outcome_map_geo_list = []
-            for single_geometry in processed_geometries:
-                # 创建原始对象的深拷贝，以保留所有属性
-                map_geo_copy = copy.deepcopy(original_map_geo)
-                # 将拷贝对象的几何替换为裁剪后的几何
-                map_geo_copy.geometry = single_geometry
-                outcome_map_geo_list.append(map_geo_copy)
-            return outcome_map_geo_list
-        else:
+        return final_geometries
+
+    @staticmethod
+    def _ensure_valid(geom: BaseGeometry) -> Optional[BaseGeometry]:
+        """尝试确保几何体有效，如果无效则尝试修复。"""
+        try:
+            if geom.is_valid:
+                return geom
+            else:
+                print(f"Warning: Geometry of type {geom.geom_type} is invalid, attempting to fix...")
+                fixed_geom = make_valid(geom)
+                # 检查修复后的结果是否有效且非空
+                if fixed_geom is not None and not fixed_geom.is_empty and fixed_geom.is_valid:
+                     print("  Successfully fixed.")
+                     return fixed_geom
+                else:
+                     print("  Failed to fix or resulted in empty geometry.")
+                     return None
+        except Exception as e:
+            print(f"Error during validation/fixing geometry: {e}")
             return None
 
     @staticmethod
-    def outcome_process(outcome: BaseGeometry) -> Optional[List[BaseGeometry]]:
+    def _flatten_and_validate(
+        geom: Optional[BaseGeometry],
+        threshold: Optional[float]
+        ) -> List[Union[Polygon, LineString]]:
         """
-        处理 Shapely 操作结果，转换为有效、非空几何对象的列表。
+        递归地将几何对象分解为基础类型 (Polygon, LineString)，
+        验证它们，并过滤掉空或过小的几何体。
+
         Args:
-            outcome: Shapely 操作返回的几何对象。
+            geom: 输入的 Shapely 几何对象 (可能是 intersection 的结果)。
+            threshold: 过滤阈值 (面积或长度)，None 表示不过滤。
+
         Returns:
-            包含有效、非空几何对象的列表，如果结果为空或无效则返回 None。
+            一个包含有效、非空、过滤后的 Polygon 和 LineString 对象的列表。
         """
-        if outcome is None or outcome.is_empty:
-            return None
+        if geom is None or geom.is_empty:
+            return []
 
-        geo_list = []
-        # 检查是否是 Multi 类型或 GeometryCollection
-        if isinstance(outcome, (MultiPolygon, MultiLineString, GeometryCollection)):
-            for single_geometry in outcome.geoms:
-                # 确保单个几何非空且有效
-                if single_geometry and not single_geometry.is_empty:
-                    # 尝试再次确保有效性，make_valid 可能产生非预期类型
-                    valid_single = make_valid(single_geometry)
-                    if not valid_single.is_empty and isinstance(valid_single, (Polygon, LineString)):
-                        # 可选: 过滤小碎片
-                        # if isinstance(valid_single, Polygon) and valid_single.area < 1e-9: continue
-                        # if isinstance(valid_single, LineString) and valid_single.length < 1e-9: continue
-                        geo_list.append(valid_single)
-                    elif isinstance(valid_single, (MultiPolygon, MultiLineString, GeometryCollection)):
-                        # 如果 make_valid 产生集合，递归处理或展平
-                        inner_processed = MapCropper.outcome_process(valid_single)
-                        if inner_processed:
-                            geo_list.extend(inner_processed)
+        valid_parts = []
 
-        # 检查是否是单个 Polygon 或 LineString
-        elif isinstance(outcome, (Polygon, LineString)):
-            if not outcome.is_empty:
-                valid_single = make_valid(outcome) # 确保结果有效
-                if not valid_single.is_empty and isinstance(valid_single, (Polygon, LineString)):
-                    # 可选: 过滤小碎片
-                    # if isinstance(valid_single, Polygon) and valid_single.area < 1e-9: continue
-                    # if isinstance(valid_single, LineString) and valid_single.length < 1e-9: continue
-                    geo_list.append(valid_single)
-                elif isinstance(valid_single, (MultiPolygon, MultiLineString, GeometryCollection)):
-                    inner_processed = MapCropper.outcome_process(valid_single)
-                    if inner_processed:
-                        geo_list.extend(inner_processed)
+        # 处理 GeometryCollection 或 Multi* 类型
+        if isinstance(geom, GeometryCollection):
+            for part in geom.geoms:
+                valid_parts.extend(RobustMapCropper._flatten_and_validate(part, threshold))
+        elif isinstance(geom, (MultiPolygon, MultiLineString)):
+             for part in geom.geoms:
+                 # 这里 part 已经是 Polygon 或 LineString，直接处理
+                 valid_parts.extend(RobustMapCropper._flatten_and_validate(part, threshold))
+        # 处理基础类型 Polygon 和 LineString
+        elif isinstance(geom, (Polygon, LineString)):
+            # 再次确保有效性，因为 intersection 可能产生轻微无效的结果
+            valid_geom = RobustMapCropper._ensure_valid(geom)
+            if valid_geom and isinstance(valid_geom, (Polygon, LineString)): # 确保修复后类型正确
+                # 过滤微小几何体
+                is_too_small = False
+                if threshold is not None:
+                    if isinstance(valid_geom, Polygon) and valid_geom.area < threshold:
+                        is_too_small = True
+                    elif isinstance(valid_geom, LineString) and valid_geom.length < threshold:
+                         is_too_small = True
 
-        return geo_list if geo_list else None
+                if not is_too_small:
+                    valid_parts.append(valid_geom)
+            elif valid_geom and isinstance(valid_geom, (GeometryCollection, MultiPolygon, MultiLineString)):
+                 # 如果修复后又变成了集合，递归处理
+                 valid_parts.extend(RobustMapCropper._flatten_and_validate(valid_geom, threshold))
+
+        # 其他几何类型 (如 Point, MultiPoint) 在此逻辑下会被忽略
+
+        return valid_parts
+
+
+# --- 示例用法 ---
+if __name__ == '__main__':
+    # 1. 定义裁剪边界框
+    minx, miny, maxx, maxy = 0, 0, 10, 10
+    clip_polygon = box(minx, miny, maxx, maxy)
+    print(f"Clip Box: {clip_polygon.wkt[:100]}...")
+
+    # 2. 创建一些示例输入几何图形
+    poly_inside = Polygon([(1, 1), (5, 1), (5, 5), (1, 5)])
+    poly_intersect = Polygon([(8, 8), (12, 8), (12, 12), (8, 12)])
+    poly_outside = Polygon([(11, 11), (15, 11), (15, 15), (11, 15)])
+    line_intersect = LineString([(5, 5), (15, 15)])
+    line_outside = LineString([(11, 1), (15, 5)])
+    multi_poly_intersect = MultiPolygon([
+        Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]), # 完全在内部
+        Polygon([(9, 9), (11, 9), (11, 11), (9, 11)]) # 部分相交
+    ])
+    geom_collection_intersect = GeometryCollection([
+        Polygon([(1, 6), (3, 6), (3, 8), (1, 8)]), # 完全在内部
+        LineString([(7, 1), (11, 5)]) # 部分相交
+    ])
+    invalid_poly = Polygon([(0,0), (10,0), (10,10), (5,5), (0,10), (0,0)]) # 自相交，无效
+
+    geometries_to_test = {
+        "poly_inside": poly_inside,
+        "poly_intersect": poly_intersect,
+        "poly_outside": poly_outside,
+        "line_intersect": line_intersect,
+        "line_outside": line_outside,
+        "multi_poly_intersect": multi_poly_intersect,
+        "geom_collection_intersect": geom_collection_intersect,
+        "invalid_poly_intersect": invalid_poly,
+        "empty_geom": Polygon(),
+        "none_geom": None
+    }
+
+    # 3. 测试裁剪函数
+    cropper = RobustMapCropper() # 虽然方法是静态的，但可以实例化
+
+    for name, geom in geometries_to_test.items():
+        print(f"\n--- Clipping '{name}' (Type: {type(geom).__name__ if geom else 'None'}) ---")
+        clipped_list = cropper.clip_geometry(geom, clip_polygon, filter_threshold=1e-9)
+
+        if clipped_list:
+            print(f"  Result ({len(clipped_list)} geometries):")
+            for i, clipped_geom in enumerate(clipped_list):
+                print(f"    {i+1}: Type={clipped_geom.geom_type}, WKT={clipped_geom.wkt[:60]}...")
+        else:
+            print("  Result: [] (No valid intersection or input was invalid/empty)")
+

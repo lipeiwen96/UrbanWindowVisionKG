@@ -15,19 +15,11 @@ WRITABLE_OBJ = ['Point', 'LineString', 'Polygon']
 
 # Rhino图层颜色匹配表
 RHINO_LAYER_COLOR_DICT = {
-    "Xkool_ProjectBoundary": (255, 255, 255, 255),  # 深灰
-    "Xkool_PlotBoundary": (105, 105, 105, 255),  # 深灰
-    "Xkool_SurroundBuilding": (105, 105, 105, 255),  # 深灰
-    "Xkool_TargetSiteBoundary": (255, 0, 255, 255),  # 洋红
-    "Xkool_SiteUnbuildableRegion": (0, 127, 0, 255),  # 深灰
-    "Xkool_BuildingMinSeperation": (255, 0, 0, 255),  # 红线
-    "Xkool_HabitatRHP_Internal": (0, 255, 255, 255),  # 建筑2：青色
-    "Xkool_HabitatRHP_4.5m+Street": (0, 255, 255, 255),  # 建筑2：青色
-    "Xkool_HabitatRHP_ForReference": (0, 255, 255, 50),  # 建筑2：青色
-    "Xkool_OtherRHP_Internal": (255, 127, 0, 255),
-    "Xkool_OtherRHP_4.5m+Street": (255, 127, 0, 255),
-    "Xkool_OtherRHP_ForReference": (255, 127, 0, 50),
-    "Xkool_BuildingDOutline": (255, 255, 255, 255),
-    "Xkool_BuildingNDOutline": (255, 255, 255, 255),
-    "Xkool_BuildingFloorLine": (0, 0, 0, 255),
+    "Base": (0, 138, 251, 255),  # 蓝色基座
+    "Land_Boundary": (180, 180, 180, 255),  # 深灰
+    "ROAD": (80, 80, 80, 255),  # 深灰
+    "LOT": (220, 220, 220, 255),  # 深灰
+    "GLA": (220, 220, 220, 255),  # 深灰
+    "Landscape": (0, 184, 90, 255),  # 深灰
+    "Building": (255, 255, 255, 255),
 }

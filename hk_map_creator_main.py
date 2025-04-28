@@ -13,6 +13,7 @@ if __name__ == "__main__":
     research_box = (830000, 814400, 840500, 824600)
     SPATIAL_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "3d_spatial_data", "b1000_Tile_Feb25.gdb_converted.json"))
     SPATIAL_TILES_OUT_DIR = os.path.abspath(os.path.join("library", "HK_map", "processed", "3d_spatial_tiles"))
+    COPY_DIR = os.path.abspath(os.path.join("library", "HK_map", "processed", "project", "spatial"))
 
     # ------------------------------------------------------------------
     # 基本信息打印
@@ -37,8 +38,10 @@ if __name__ == "__main__":
         fmt="3DS",
         geojson_path=SPATIAL_GEOJSON_PATH,
         out_dir=SPATIAL_TILES_OUT_DIR,
+        copy_dir=COPY_DIR,
         workers=12,
         overwrite=False,  # 如需重新下载改为 True
+        load_terrain=False
     )
     # print("\nDownloaded / existing tile folders:")
     # for f in files:
@@ -50,12 +53,18 @@ if __name__ == "__main__":
     BUILDING_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "building", "BUILDING_STRUCTURE.json"))
     LOT_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "lot", "LOT.json"))
     GLA_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "lot", "GovernmentLandAllocation.json"))
+    INV_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "road", "INV_PG.json"))  # 道路
+    HKBD_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "DCD_hk80.json"))  # 道路
+    GREENING_GEOJSON_PATH = os.path.abspath(os.path.join("library", "HK_map", "row_map", "greening", "greening_format.json"))  # 道路
     MODEL_OUT_DIR = os.path.abspath(os.path.join("library", "HK_map", "processed", "model"))
     print("--- 调用 MAP-Processor ---")
     hk_map = MapProcessor(
         building_geojson=BUILDING_GEOJSON_PATH,
         lot_geojson=LOT_GEOJSON_PATH,
         gla_geojson=GLA_GEOJSON_PATH,
+        inv_geojson=INV_GEOJSON_PATH,
+        hkbd_geojson=HKBD_GEOJSON_PATH,
+        gn_geojson=GREENING_GEOJSON_PATH,
         research_box=research_box, min_building_area=90, min_lot_area=100
     )
     hk_map.run(out_dir=MODEL_OUT_DIR, analyse=PERFORM_BUILDING_ANALYSIS)

@@ -80,3 +80,5 @@ rhino3dm
 trimesh
 pyassimp
 pyfqmr
+osmium
+osmnx

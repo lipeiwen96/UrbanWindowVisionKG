@@ -65,6 +65,7 @@ class SpatialTileDownloader:
         fmt: str,
         geojson_path: os.PathLike | str,
         out_dir: os.PathLike | str,
+        copy_dir: os.PathLike | str,
         overwrite: bool = False,
         workers: int = 6,
         load_terrain: bool = True, # 控制是否加载地形的新标志
@@ -92,7 +93,9 @@ class SpatialTileDownloader:
 
         geojson_path = Path(geojson_path).expanduser().resolve()
         out_dir = Path(out_dir).expanduser().resolve()
+        copy_dir = Path(copy_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        copy_dir.mkdir(parents=True, exist_ok=True)
         trash_dir = out_dir / ".trash" # 回收站目录
         trash_dir.mkdir(exist_ok=True)
 
@@ -262,6 +265,20 @@ class SpatialTileDownloader:
             print("\n--- 地形加载已跳过 ('trimesh' 或 'numpy' 库未安装) ---")
         else:
              print("\n--- 地形加载功能已禁用 ---")
+        # --- 结束新增部分 ---
+
+        # --- 新增：地形文件复制 ---
+        if copy_dir and fmt.upper() == '3DS':  # 目前只对 3DS 格式复制地形文件
+            print("\n--- 开始复制地形文件 ---")
+            SpatialTileDownloader._copy_terrain_files(
+                tile_paths=valid_tile_paths,
+                copy_dir=copy_dir,
+                fmt=fmt  # 传递格式
+            )
+        elif copy_dir:
+            print(f"\n--- 地形文件复制已跳过 (仅支持 fmt='3DS', 当前为 '{fmt}') ---")
+        else:
+            print("\n--- 地形文件复制功能未启用 (未指定 'copy_dir') ---")
         # --- 结束新增部分 ---
 
         return valid_tile_paths # 返回成功处理的 Tile 路径列表
@@ -724,6 +741,95 @@ class SpatialTileDownloader:
         print(f"成功加载的网格数量: {loaded_count}")
         print(f"面数超过阈值 ({face_threshold}) 的网格数量: {warning_count}")
         print(f"加载过程中出错的数量: {error_count}")
+        print("-" * 60)
+
+    # --- 新增：地形文件复制方法 ---
+    @staticmethod
+    def _copy_terrain_files(tile_paths: List[str], copy_dir: Path, fmt: str):
+        """
+        将指定 Tile 路径列表中的地形文件复制到目标目录。
+        优先复制 'simplify_*.fmt' 文件。
+        """
+        fmt_ext = fmt.lower()
+        # 再次确认格式，尽管调用处已检查
+        if fmt_ext != '3ds':
+            print(f"内部警告：_copy_terrain_files 仅应处理 '3ds' 格式，收到 '{fmt}'。跳过复制。")
+            return
+
+        copied_count = 0
+        skipped_count = 0  # 因为目标已存在而跳过
+        error_count = 0
+        not_found_count = 0  # 未找到源文件
+
+        print(f"目标复制目录: {copy_dir}")
+        print("-" * 60)
+
+        for tile_path_str in tile_paths:
+            tile_path = Path(tile_path_str)
+            tile_name = tile_path.name  # 例如 '7SW15C'
+            # print(f"检查 Tile 进行复制: {tile_name}") # 可选：更详细的日志
+
+            terrain_folder: Optional[Path] = None
+            # 查找地形子文件夹 (以 'T' 开头)
+            try:
+                terrain_folders = list(tile_path.glob("T*"))
+                if not terrain_folders:
+                    # print(f"  信息: {tile_name} 中未找到地形子文件夹 (T*)") # 可选
+                    not_found_count += 1  # 算作未找到源文件的一种情况
+                    continue
+                terrain_folder = terrain_folders[0]  # 假定第一个是正确的
+                if not terrain_folder.is_dir():
+                    # print(f"  信息: {tile_name} 中找到 T* 但不是目录") # 可选
+                    not_found_count += 1
+                    continue
+            except Exception as e:
+                print(f"  错误: 访问 {tile_name} 子文件夹时出错: {e}")
+                error_count += 1
+                continue
+
+            terrain_folder_name = terrain_folder.name  # 例如 'T830815'
+            simplified_file = terrain_folder / f"simplify_{terrain_folder_name}.{fmt_ext}"
+            original_file = terrain_folder / f"{terrain_folder_name}.{fmt_ext}"
+            file_to_copy: Optional[Path] = None
+            copy_type = ""  # 记录复制的是简化版还是原始版
+
+            # 优先选择简化文件
+            if simplified_file.is_file():
+                file_to_copy = simplified_file
+                copy_type = "简化版"
+            elif original_file.is_file():
+                file_to_copy = original_file
+                copy_type = "原始版"
+            else:
+                print(f"  信息: 在 {terrain_folder} 中未找到 '.{fmt_ext}' 或 'simplify_*.{fmt_ext}' 地形文件")
+                not_found_count += 1
+                continue
+
+            # --- 执行复制 ---
+            # 使用源文件名作为目标文件名
+            dest_file_path = copy_dir / file_to_copy.name
+            print(f"  准备复制: {file_to_copy.name} ({copy_type}) from {tile_name}")
+
+            if dest_file_path.exists():
+                print(f"    -> 跳过: 文件 '{dest_file_path.name}' 已存在于目标目录。")
+                skipped_count += 1
+                continue
+
+            try:
+                # 使用 copy2 保留元数据
+                shutil.copy2(file_to_copy, dest_file_path)
+                print(f"    -> 复制成功: {dest_file_path.name}")
+                copied_count += 1
+            except Exception as e:
+                print(f"    -> 错误: 复制文件 {file_to_copy.name} 时出错: {e}")
+                error_count += 1
+            # print("-" * 30) # 可选：每个文件复制后的分隔符
+
+        print(f"\n--- 地形文件复制总结 ---")
+        print(f"成功复制的文件数量: {copied_count}")
+        print(f"因目标已存在而跳过的数量: {skipped_count}")
+        print(f"未找到源地形文件的 Tile 数量: {not_found_count}")
+        print(f"复制过程中出错的数量: {error_count}")
         print("-" * 60)
 
 

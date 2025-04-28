@@ -1,10 +1,8 @@
 # map_structure.py
 from dataclasses import field, dataclass
-from typing import List, Optional
-import shapely
+from typing import Optional
 from shapely.geometry.base import BaseGeometry
-from shapely.geometry import Polygon, Point, LineString, GeometryCollection, box, MultiPolygon
-from map_system.row_map_data_reader import MapGeoReader
+from map_system.utils.row_map_data_reader import MapGeoReader
 
 
 @dataclass
@@ -68,7 +66,7 @@ class MapBuilding(MapBaseGeometry):
             self.length = row_data['properties']['SHAPE_Length'] if row_data['properties']['SHAPE_Length'] is not None else geo.length
             self.area = row_data['properties']['SHAPE_Area'] if row_data['properties']['SHAPE_Area'] is not None else geo.area
             self.object_id = row_data['properties']['OBJECTID']
-            self.start_height = row_data['properties']['BASEHEIGHT'] if row_data['properties']['BASEHEIGHT'] is not None else 0
+            self.start_height = row_data['properties']['BASEHEIGHT'] if row_data['properties']['BASEHEIGHT'] is not None else -0.5
             # 这里补充一个建筑最低高度的处理
             # if self.start_height < -10:
             #     self.start_height = -10
@@ -142,3 +140,27 @@ class MapRoadPolygon(MapBaseGeometry):
         else:
             raise Exception(f"道路图形数据读取失败，道路object_id: {row_data['properties']['OBJECTID']}, 道路坐标{row_data['geometry']['coordinates']}")
 
+
+@dataclass
+class MapAdminBoundary(MapBaseGeometry):
+
+    def init(self, row_data: dict):
+        self.row_data = row_data
+        geo = MapGeoReader.geo_reader(row_data["geometry"]["type"], row_data["geometry"]["coordinates"])
+        if geo is not None:
+            self.geometry = geo
+            self.geom_type = geo.geom_type
+        else:
+            raise Exception(f"区域图形数据读取失败，边界id: {row_data['properties']['OBJECTID']}, 边界坐标{row_data['geometry']['coordinates']}")
+
+
+@dataclass
+class MapGreeningBoundary(MapBaseGeometry):
+    def init(self, row_data: dict):
+        self.row_data = row_data
+        geo = MapGeoReader.geo_reader(row_data["geometry"]["type"], row_data["geometry"]["coordinates"])
+        if geo is not None:
+            self.geometry = geo
+            self.geom_type = geo.geom_type
+        else:
+            raise Exception(f"绿化图形数据读取失败，绿化坐标{row_data['geometry']['coordinates']}")
