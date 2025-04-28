@@ -173,7 +173,7 @@ class RhinoFileWriter:
             layer_index = all_layer_name.index("Default")
             return all_layer_index[layer_index]
 
-    def write_3dm_file(self, data_model:DataModel):
+    def write_3dm_file(self, data_model:DataModel, *, unit="Centimeters"):
         """
         根据输入的数据类型选择处理方式
         :param data_model:
@@ -181,6 +181,12 @@ class RhinoFileWriter:
         """
         if not isinstance(data_model, DataModel):
             raise ValueError("輸入數據不是DataModel, 目前仅支持ART的DataModel")
+
+        self.doc.Settings.ModelUnitSystem = getattr(
+            rhino3dm.UnitSystem, unit, rhino3dm.UnitSystem.Centimeters
+        )
+        # ② 如果想让长度显示成整数，还可以写比例：
+        #    self.doc.Settings.ModelAbsoluteTolerance = 0.001  # 自己按需
 
         self._data_structure_processor(data_model=data_model)
         self.doc.Write(self.file_path, version=WRITE_VERSION)

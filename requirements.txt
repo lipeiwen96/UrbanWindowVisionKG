@@ -76,3 +76,7 @@ wget==3.2
 XlsxWriter==3.1.0
 zipp==3.15.0
 oss2==2.16.0
+rhino3dm
+trimesh
+pyassimp
+pyfqmr

@@ -1,15 +1,16 @@
+# map_structure.py
 from dataclasses import field, dataclass
-from typing import List
+from typing import List, Optional
 import shapely
 from shapely.geometry.base import BaseGeometry
 from shapely.geometry import Polygon, Point, LineString, GeometryCollection, box, MultiPolygon
-from map_system.tile_genenrator.row_map_data_reader import MapGeoReader
+from map_system.row_map_data_reader import MapGeoReader
 
 
 @dataclass
 class MapBaseGeometry:
     # 图形数据
-    geometry: BaseGeometry = field(default_factory=BaseGeometry)
+    geometry: Optional[BaseGeometry] = field(default=None) # 使用 None 作为默认值
     geom_type: str = field(default="")
     length: float = field(default=0)
     area: float = field(default=0)
@@ -49,6 +50,14 @@ class MapRoadCenterLine(MapBaseGeometry):
 
 @dataclass
 class MapBuilding(MapBaseGeometry):
+    building_structure_id: str = field(default="")
+    building_csuid: str = field(default="")
+    building_structure_type: str = field(default="")
+    official_building_name_tc: str = field(default="")
+    official_building_name_en: str = field(default="")
+    num_above_ground_storeys: int = field(default=0)
+    category: str = field(default="")
+    status: str = field(default="")
 
     def init(self, row_data: dict):
         self.row_data = row_data
@@ -56,8 +65,8 @@ class MapBuilding(MapBaseGeometry):
         if geo is not None:
             self.geometry = geo
             self.geom_type = geo.geom_type
-            self.length = row_data['properties']['SHAPE_Length']
-            self.area = row_data['properties']['SHAPE_Area']
+            self.length = row_data['properties']['SHAPE_Length'] if row_data['properties']['SHAPE_Length'] is not None else geo.length
+            self.area = row_data['properties']['SHAPE_Area'] if row_data['properties']['SHAPE_Area'] is not None else geo.area
             self.object_id = row_data['properties']['OBJECTID']
             self.start_height = row_data['properties']['BASEHEIGHT'] if row_data['properties']['BASEHEIGHT'] is not None else 0
             # 这里补充一个建筑最低高度的处理
@@ -67,6 +76,16 @@ class MapBuilding(MapBaseGeometry):
             self.height = round(top_height - self.start_height, 2)
         else:
             raise Exception(f"建筑数据读取失败，建筑object_id: {row_data['properties']['OBJECTID']}, 建筑坐标{row_data['geometry']['coordinates']}")
+
+        p = row_data["properties"]  # 方便书写
+        self.building_structure_id = p.get("BUILDINGSTRUCTUREID", "")
+        self.building_csuid = p.get("BUILDINGCSUID", "")
+        self.building_structure_type = p.get("BUILDINGSTRUCTURETYPE", "")
+        self.category = p.get("CATEGORY", "")
+        self.status = p.get("STATUS", "")
+        self.official_building_name_en = p.get("OFFICIALBUILDINGNAMEEN", "")
+        self.official_building_name_tc = p.get("OFFICIALBUILDINGNAMETC", "")
+        self.num_above_ground_storeys = p.get("NUMABOVEGROUNDSTOREYS", 0)
 
 
 @dataclass
