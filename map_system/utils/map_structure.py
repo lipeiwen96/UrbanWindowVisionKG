@@ -90,6 +90,7 @@ class MapBuilding(MapBaseGeometry):
         return {
             "object_id": self.object_id,
             "building_structure_id": self.building_structure_id,
+            "building_structure_type": self.building_structure_type,
             "status": self.status,
             "category": self.category,
             "official_building_name_en": self.official_building_name_en,

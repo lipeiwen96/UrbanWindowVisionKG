@@ -82,3 +82,5 @@ pyassimp
 pyfqmr
 osmium
 osmnx
+mapbox_earcut
+pyproj

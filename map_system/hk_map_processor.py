@@ -648,7 +648,7 @@ class MapProcessor:
         if self.research_box_polygon:
             try:
                 model.insert_element(DataElement(
-                    self.research_box_polygon, layer="Base", start_height=-80, height=75))
+                    self.research_box_polygon, layer="Base", start_height=-80, height=77))
                 print(f"  已添加研究范围边界元素。")
             except Exception as e: print(f"  警告: 无法添加研究范围边界元素: {e}")
 
@@ -659,7 +659,7 @@ class MapProcessor:
             try:
                 layer_name = "GLA" if getattr(lot, 'is_GLA', False) else "LOT"
                 model.insert_element(DataElement(
-                    lot.geometry, layer=layer_name, start_height=-5, height=5.2, custom_semantics=lot.to_dict))
+                    lot.geometry, layer=layer_name, start_height=-3, height=3.2, custom_semantics=lot.to_dict))
                 lot_count += 1
             except Exception as e:
                 lot_id_str = getattr(lot, 'lot_id', getattr(lot, 'gla_id', '未知ID'))
@@ -672,7 +672,7 @@ class MapProcessor:
         for road in self.roads:
             try:
                 model.insert_element(DataElement(
-                    road.geometry, layer="ROAD", start_height=-5, height=5.0, custom_semantics=road.to_dict)) # 道路略高于地块
+                    road.geometry, layer="ROAD", start_height=-3, height=3.0, custom_semantics=road.to_dict)) # 道路略高于地块
                 road_count += 1
             except Exception as e:
                 road_id_str = getattr(road, 'object_id', '未知ID')
@@ -686,7 +686,7 @@ class MapProcessor:
             try:
                 # 行政区通常是线划，但也可能是面，这里按面处理，放在比道路稍高
                 model.insert_element(DataElement(
-                    admin.geometry, layer="Land_Boundary", start_height=-5, height=4.5))
+                    admin.geometry, layer="Land_Boundary", start_height=-3, height=2.5))
                 admin_count += 1
             except Exception as e:
                 admin_id_str = getattr(admin, 'object_id', '未知ID') # 假设 ID 属性名
@@ -700,7 +700,7 @@ class MapProcessor:
             try:
                 # 绿地放在地块同高度或略高
                 model.insert_element(DataElement(
-                    green.geometry, layer="Landscape", start_height=-5, height=5.5)) # 略高于地块
+                    green.geometry, layer="Landscape", start_height=-3, height=3.5)) # 略高于地块
                 green_count += 1
             except Exception as e:
                 green_id_str = getattr(green, 'object_id', '未知ID') # 假设 ID 属性名

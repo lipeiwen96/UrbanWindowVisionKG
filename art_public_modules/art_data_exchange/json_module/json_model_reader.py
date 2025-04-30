@@ -45,23 +45,23 @@ class JsonFileReader:
                 cur_element.id = each['element_id']
                 cur_element.geom_type = cur_element.geometry.geom_type
 
-                cur_element.material.diffuse = each['material']['element_diffuse']
-                cur_element.material.diffuse_opacity = each['material']['element_diffuse_opacity']
-                cur_element.material.is_outline = each['material']['element_is_outline']
-                cur_element.material.outline_color = each['material']['element_outline_color']
-                cur_element.material.outline_opacity = each['material']['element_outline_opacity']
-                cur_element.material.outline_width = each['material']['element_outline_width']
-                cur_element.material.outline_type = each['material']['element_outline_type']
-                cur_element.material.texture_pic = each['material']['element_texture_pic']
-                cur_element.material.texture_scale = each['material']['element_texture_scale']
-                cur_element.material.texture_rotate = each['material']['element_texture_rotate']
-                cur_element.material.effect_type = each['material']['element_effect_type']
+                # cur_element.material.diffuse = each['material']['element_diffuse']
+                # cur_element.material.diffuse_opacity = each['material']['element_diffuse_opacity']
+                # cur_element.material.is_outline = each['material']['element_is_outline']
+                # cur_element.material.outline_color = each['material']['element_outline_color']
+                # cur_element.material.outline_opacity = each['material']['element_outline_opacity']
+                # cur_element.material.outline_width = each['material']['element_outline_width']
+                # cur_element.material.outline_type = each['material']['element_outline_type']
+                # cur_element.material.texture_pic = each['material']['element_texture_pic']
+                # cur_element.material.texture_scale = each['material']['element_texture_scale']
+                # cur_element.material.texture_rotate = each['material']['element_texture_rotate']
+                # cur_element.material.effect_type = each['material']['element_effect_type']
 
                 cur_element.custom_semantics = each['element_custom_semantics']
                 data_elements.append(cur_element)
             data_model = DataModel(elements=data_elements, name=row_data['model_name'])
             data_model.id = row_data['model_id']
-            data_model.user_data = row_data["user_data"]
+            # data_model.user_data = row_data["user_data"]
 
             return data_model
         else:
