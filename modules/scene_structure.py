@@ -18,6 +18,8 @@ from modules.renderer import SKY_LABEL, LABEL_DTYPE  # Import SKY_LABEL if neede
 from pyproj import Transformer # <-- Add pyproj import
 from pyproj.exceptions import CRSError # <-- Add exception import
 import random
+from modules.window_generator import WindowGenerator, WindowMetadata, WINDOW_COLOR, DEFAULT_WINDOW_WIDTH_M, DEFAULT_WINDOW_SPACING_M # 导入所需
+
 
 # --- 数据类型和颜色映射 (参考之前的定义) ---
 GEOMETRY_DTYPE = np.float32
@@ -57,7 +59,9 @@ COLOR_MAP = {
     "Mountain": np.array([100, 175, 95], dtype=COLOR_DTYPE),     # 基础山体 - 更鲜明的绿
     "MountainNorth": np.array([95, 170, 90], dtype=COLOR_DTYPE), # 北侧山体 - 略微调整
     "MountainSouth": np.array([110, 185, 105], dtype=COLOR_DTYPE),# 南侧山体 - 更亮绿
-    "Tree": np.array([30, 180, 60], dtype=COLOR_DTYPE),         # 非常鲜明的树木绿
+    "Tree": np.array([30, 180, 60], dtype=COLOR_DTYPE),
+    # 非常鲜明的树木绿# --- 新增: 窗户颜色 ---
+    "Window": WINDOW_COLOR if WindowGenerator else np.array([173, 216, 230], dtype=COLOR_DTYPE), # 如果导入失败，使用默认
 
     # --- 调试 ---
     "Unknown": np.array([255, 0, 255], dtype=COLOR_DTYPE),      # Magenta for testing
@@ -89,6 +93,7 @@ TYPE_TO_LABEL_MAP = {
     "MountainNorth": 6,
     "MountainSouth": 6,
     "Tree": 7,
+    "Window": 8,
     # --- Fallback ---
     "Unknown": -1,      # 忽略未知类型
 }
@@ -106,6 +111,8 @@ class MeshElement:
     vertex_indices: TriIndices  # 指向本 Object.vertices 的索引
     color: np.ndarray
     mesh_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # --- ADDED FIELD ---
+    label_id: Optional[int] = None # Allows overriding parent object's label
 
     def __hash__(self):
         # Hash 仍然基于 mesh_id
@@ -290,6 +297,10 @@ class Object:
                 else:
                     self.object_type = "Building_P"
         # print(f"    - Geometry Type: {geom.geom_type}, Start Z: {z0:.2f}, Height: {height_val:.2f}, Top Z: {z1:.2f}")
+
+        # 存储源几何图形 (在类型确定后)
+        if self.object_type in ["Building", "Building_T", "Building_P"]:
+            self.source_geometry = geom
 
         z1 = z0 + height_val
 
@@ -542,7 +553,13 @@ class Scene:
             return False # Indicate failure/skip
 
     # ──────────────────── 批量导入 DataElement ────────────────────
-    def load_elements(self, elements: List[DataElement], report_interval: int = 500):
+    def load_elements(self, elements: List[DataElement], report_interval: int = 500,
+                      generate_windows_flag: bool = False,  # 是否启用窗户生成
+                      window_aoi_wkt: Optional[str] = None,  # 窗户生成的AOI区域 (WKT字符串)
+                      window_metadata_output_path: Optional[str | Path] = None,  # 窗户元数据输出路径
+                      window_config: Optional[Dict[str, Any]] = None,  # 传递给WindowGenerator的配置
+                      target_building_types: List[str] = ["Building_T", "Building_P"]  # 目标建筑类型
+                      ):
         """Loads DataElements into the scene, creating Objects."""
         total_elements_to_process = len(elements)
         print(f"\n▶ Starting bulk import of DataElements...")
@@ -552,31 +569,192 @@ class Scene:
         elements_processed = 0
         verts_added_phase = 0
         meshes_added_phase = 0
+        # --- 用于存储符合窗户生成条件的建筑对象 ---
+        buildings_for_window_gen: List[Object] = []
+        aoi_polygon: Optional[Polygon] = None
 
+        # --- 预处理窗户生成 AOI (如果启用) ---
+        if generate_windows_flag:
+            aoi_polygon = wkt_loads(window_aoi_wkt)
+            print(f"  ✅ 已启用窗户生成，并成功解析 AOI Polygon。")
+
+        # --- 第一阶段：加载所有元素并识别需要生成窗户的建筑 ---
+        print("  ⏳ 正在加载元素并识别目标建筑...")
+        objects_dict = {}  # 用于快速查找已创建的对象
         for i, ele in enumerate(elements, 1):
             elements_processed += 1
-            obj = Object() # Create a new object for each element
+            obj = Object()
             verts_added, meshes_added = obj.init_from_element(ele)
 
             if self._add_if_valid(obj, verts_added, meshes_added):
                 valid_objects_created += 1
                 verts_added_phase += verts_added
                 meshes_added_phase += meshes_added
+                objects_dict[obj.object_id] = obj # 添加到查找字典
+
+                # --- 检查是否为需要生成窗户的建筑，且在 AOI 内 ---
+                if (generate_windows_flag and
+                        aoi_polygon and  # 确保 AOI 有效
+                        obj.object_type in target_building_types and
+                        obj.source_geometry and  # 确保 source_geometry 已被设置
+                        obj.source_geometry.intersects(aoi_polygon)):  # 使用 intersects 检查重叠
+                    buildings_for_window_gen.append(obj)  # 收集符合条件的对象
 
             if i % report_interval == 0 or i == total_elements_to_process:
                 elapsed = time.time() - t0
-                print(f"  ● Progress: Processed {i}/{total_elements_to_process} elements. "
-                      f"Valid Objects: {valid_objects_created}. "
-                      f"Scene Totals: {self.total_vertices} verts, {self.total_mesh_elements} meshes. "
-                      f"Time: {elapsed:.1f}s")
+                print(f"\r  ● 元素加载进度: {i}/{total_elements_to_process}."
+                      f" 有效对象: {valid_objects_created}."
+                      f" 场景总计: {self.total_vertices} 顶点, {self.total_mesh_elements} 面。"
+                      f" 已耗时: {elapsed:.1f}s", end="")
 
         elapsed_total = time.time() - t0
-        print(f"✔ Finished DataElement import.")
-        print(f"  Summary for DataElement Loading:")
-        print(f"    - Processed: {elements_processed}/{total_elements_to_process} DataElements")
-        print(f"    - Created:   {valid_objects_created} valid Objects")
-        print(f"    - Added:     {verts_added_phase} vertices, {meshes_added_phase} mesh elements in this phase.")
-        print(f"    - Time:      {elapsed_total:.2f}s\n")
+        print(f"✔ 完成 DataElement 导入阶段。")
+        print(f"  此阶段总结:")
+        print(f"    - 处理元素: {elements_processed}/{total_elements_to_process}")
+        print(f"    - 创建有效对象: {valid_objects_created}")
+        print(f"    - 添加几何: {verts_added_phase} 顶点, {meshes_added_phase} 面。")
+        print(f"    - 发现符合窗户生成条件的建筑: {len(buildings_for_window_gen)} 个")
+        print(f"    - 耗时: {elapsed_total:.2f}s\n")
+
+        # --- 循环结束后，执行窗户生成 ---
+        if generate_windows_flag and buildings_for_window_gen:
+            print(f"\n▶ 开始为 {len(buildings_for_window_gen)} 个符合条件的建筑生成窗户...")
+            t0_window_gen = time.time()
+
+            # 准备窗户生成器的配置
+            window_gen_params = window_config if window_config else {}
+            # 如果路径有效，则传递给 save_metadata
+            output_path_for_meta = Path(window_metadata_output_path) if window_metadata_output_path else None
+
+            try:
+                # 实例化 WindowGenerator (现在不依赖 scene_structure)
+                generator = WindowGenerator(**window_gen_params)
+
+                # 调用生成函数 (传入收集到的建筑列表和 AOI)
+                # generate_windows 返回: new_window_objects, window_metadata, processed_building_ids
+                window_metadata, windows_geometry_by_building = generator.generate_windows(
+                    buildings_for_window_gen, aoi_polygon)
+                log_time(f"窗户生成完成", t0_window_gen)
+                print(f"  窗户生成总结:")
+
+                log_time(f"窗户几何数据生成完成", t0_window_gen)  # 这里的时间可能不准，因为日志函数可能有问题
+                print(f"  窗户生成总结:")
+                print(f"    - 生成的元数据记录数: {len(window_metadata)}")
+                total_geom_groups = sum(len(v) for v in windows_geometry_by_building.values())
+                print(f"    - 生成的窗户几何数据组数: {total_geom_groups}")
+
+                # --- 开始集成窗户几何数据 ---
+                print("\n  ⏳ 开始将窗户几何数据集成到建筑对象中...")
+                integration_start_time = time.time()
+                verts_added_windows_total = 0
+                meshes_added_windows_total = 0
+                window_label_id = TYPE_TO_LABEL_MAP.get("Window", DEFAULT_LABEL)
+                buildings_integrated_count = 0
+                total_buildings_to_integrate = len(windows_geometry_by_building)
+
+                # 使用 list(dict.items()) 复制键值对，以便在循环中安全删除
+                integration_items = list(windows_geometry_by_building.items())
+
+
+                for building_id, window_geometries in integration_items:
+                    buildings_integrated_count += 1
+                    target_building = objects_dict.get(building_id)
+                    if not target_building:
+                        print(f"    🟡 警告: 在集成期间未找到建筑 {building_id}，跳过。")
+                        # 在删除前确保从原始字典中删除，即使处理失败
+                        if building_id in windows_geometry_by_building:
+                            del windows_geometry_by_building[building_id]
+                        continue
+
+                    num_windows_for_building = len(window_geometries)
+                    verts_added_this_building = 0
+                    meshes_added_this_building = 0
+                    print(f"    -> 集成建筑 {buildings_integrated_count}/{total_buildings_to_integrate}: "
+                          f"ID='{building_id}', 类型='{target_building.object_type}', "
+                          f"窗户数={num_windows_for_building}")
+
+                    integration_report_interval = max(1000, num_windows_for_building // 10)  # 每处理1000个或10%的窗户报告一次
+
+                    for i, (win_vertices, win_faces) in enumerate(window_geometries):
+                        if not win_vertices or not win_faces: continue
+
+                        vert_map = {}
+                        # 添加窗户顶点到建筑对象
+                        for vert_i, vert_coords in enumerate(win_vertices):
+                            global_idx = target_building._add_vertex(vert_coords)
+                            vert_map[vert_i] = global_idx
+                            verts_added_this_building += 1
+
+                        # 添加窗户面片到建筑对象
+                        for face in win_faces:
+                            try:
+                                a_local, b_local, c_local = face
+                                a_global = vert_map[a_local]
+                                b_global = vert_map[b_local]
+                                c_global = vert_map[c_local]
+
+                                # 创建 MeshElement，指定颜色和标签
+                                window_mesh = MeshElement(
+                                    parent_object_id=target_building.object_id,
+                                    parent_object_type=target_building.object_type,
+                                    vertex_indices=(a_global, b_global, c_global),
+                                    color=WINDOW_COLOR.copy(),
+                                    label_id=window_label_id
+                                )
+                                target_building.mesh_elements.append(window_mesh)
+                                meshes_added_this_building += 1
+                            except KeyError as ke:
+                                # print(f"    🔴 错误: KeyError {ke} 在集成建筑 {building_id} 的面时。 Vert Map: {vert_map}, Face: {face}")
+                                pass  # 减少输出
+                            except Exception as e_int:
+                                # print(f"    🔴 错误: 在集成建筑 {building_id} 的面时出错: {e_int}")
+                                pass  # 减少输出
+
+                        # 在集成单个建筑时报告进度
+                        if (i + 1) % integration_report_interval == 0 or (i + 1) == num_windows_for_building:
+                            current_verts = len(target_building.vertices)
+                            current_meshes = len(target_building.mesh_elements)
+                            print(f"\r       进度: 已集成 {i + 1}/{num_windows_for_building} 个窗户。"
+                                  f" 当前建筑顶点: {current_verts}, 面片: {current_meshes}", end="")
+
+                    print()  # 单个建筑集成完毕后换行
+                    print(
+                        f"       集成完毕: 共添加 {verts_added_this_building} 顶点, {meshes_added_this_building} 面片。")
+                    verts_added_windows_total += verts_added_this_building
+                    meshes_added_windows_total += meshes_added_this_building
+
+                    # --- 关键优化：处理完一个建筑后，从字典中删除其几何数据以释放内存 ---
+                    try:
+                        del windows_geometry_by_building[building_id]
+                        # print(f"       已释放建筑 {building_id} 的窗户几何数据内存。") # 可以取消注释用于调试
+                    except KeyError:
+                        print(f"    🟡 警告: 尝试删除已处理的建筑 {building_id} 数据时未找到键。")
+
+                    # --- 所有建筑集成完毕 ---
+                integration_elapsed = time.time() - integration_start_time
+                print(f"  ✔ 完成所有窗户几何数据集成。")
+                print(f"    - 集成阶段添加总计: {verts_added_windows_total} 顶点, {meshes_added_windows_total} 面片。")
+                print(f"    - 集成阶段耗时: {integration_elapsed:.2f}s")
+
+                # 更新场景总数
+                self.total_vertices += verts_added_windows_total
+                self.total_mesh_elements += meshes_added_windows_total
+                print(f"    - 当前场景累计: {self.total_vertices} 顶点, {self.total_mesh_elements} 面。")
+
+                # 保存元数据
+                if window_metadata and output_path_for_meta:
+                    WindowGenerator.save_metadata(window_metadata, output_path_for_meta)
+                elif window_metadata:
+                    print("  🟡 警告: 生成了窗户元数据，但未提供有效的输出路径。")
+
+            except Exception as e_win_integration:
+                print(f"  🔴 在窗户生成或集成过程中发生严重错误: {e_win_integration}")
+                import traceback
+                traceback.print_exc()
+
+        elif generate_windows_flag:
+            print("\n▶ 未找到符合窗户生成条件的建筑，跳过窗户生成和集成。")
+        # --- 窗户生成逻辑结束 ---
 
     # ──────────────────── 单 OBJ 导入 ────────────────────
     def load_obj(self, path: str | Path, obj_type: str):
@@ -747,7 +925,6 @@ class Scene:
                 else:
                     # print(f"  🟡 Skipping feature {i+1}: Tree object resulted in no addable geometry.")
                     trees_failed_count += 1
-
 
             except (TypeError, ValueError) as te:
                 print(f"  🟡 Skipping feature {i + 1}: Error processing properties or coordinates - {te}")
@@ -1110,131 +1287,156 @@ class Scene:
             - color_map: Dictionary mapping used label IDs to colors.
             Returns None if the scene is empty.
         """
-        print("\n▶ Flattening scene geometry for renderer...")
+        print("\n▶ 正在为渲染器展平场景几何体...")
         t0_flatten = time.time()
 
         if not self.objects:
-            print("  场景为空，无法 flatten。")
+            print("  场景为空，无法展平。")
             return None
 
-        all_v0s = []
-        all_e1s = []
-        all_e2s = []
-        all_normals = []
-        all_labels = []
-        all_colors = []
-        used_label_ids = set()  # Keep track of labels actually used
+        # 优化：预估大小并使用列表，最后转换为 NumPy 数组
+        # 预估总面片数，可以稍微多估算一点
+        estimated_triangles = self.total_mesh_elements + 1000  # 加一点余量
+        all_v0s_list = []
+        all_e1s_list = []
+        all_e2s_list = []
+        all_normals_list = []
+        all_labels_list = []
+        all_colors_list = []
+        used_label_ids = set()
 
         processed_triangles = 0
         skipped_degenerate = 0
+        skipped_ignored_label = 0
 
-        for obj in self.objects:
-            obj_type = obj.object_type
-            label_id = TYPE_TO_LABEL_MAP.get(obj_type, DEFAULT_LABEL)
+        total_objs = len(self.objects)
+        flatten_report_interval = max(1, total_objs // 10)
 
-            # Skip objects marked with SKY_LABEL or other ignored labels directly
-            if label_id == SKY_LABEL or label_id < 0:
-                # print(f"  Skipping object '{obj.object_id}' type '{obj_type}' (label {label_id})")
-                continue
-
-            # Determine the color based on the object's type/color attribute
-            # Use the object's color directly as the base color for the triangle
-            base_color = obj.color  # Should be a numpy uint8 array
-
+        print("  ⏳ 开始处理对象...")
+        for i, obj in enumerate(self.objects):
             num_obj_vertices = len(obj.vertices)
             if num_obj_vertices == 0:
-                continue  # Skip objects with no vertices
+                continue
 
-            for mesh_element in obj.mesh_elements:
+            # 对当前对象的所有面片进行处理
+            obj_mesh_elements = obj.mesh_elements
+            obj_vertices = obj.vertices  # 减少属性访问次数
+            obj_type = obj.object_type
+            default_obj_label = TYPE_TO_LABEL_MAP.get(obj_type, DEFAULT_LABEL)
+
+            for mesh_element in obj_mesh_elements:
                 try:
-                    idx_a, idx_b, idx_c = mesh_element.vertex_indices
+                    # 确定标签 ID
+                    label_id = mesh_element.label_id if mesh_element.label_id is not None else default_obj_label
 
-                    # Basic index validity check
-                    if not (0 <= idx_a < num_obj_vertices and 0 <= idx_b < num_obj_vertices and 0 <= idx_c < num_obj_vertices):
-                        # print(f"  🟡 无效索引在 object '{obj.object_id}' (类型 {obj_type}) 的 mesh {mesh_element.mesh_id} 中: {idx_a}, {idx_b}, {idx_c} (max: {num_obj_vertices-1})")
+                    # 跳过需要忽略的标签
+                    if label_id == SKY_LABEL or label_id < 0:
+                        skipped_ignored_label += 1
                         continue
 
-                    # Retrieve vertex coordinates
-                    v_a = np.array(obj.vertices[idx_a], dtype=GEOMETRY_DTYPE)
-                    v_b = np.array(obj.vertices[idx_b], dtype=GEOMETRY_DTYPE)
-                    v_c = np.array(obj.vertices[idx_c], dtype=GEOMETRY_DTYPE)
+                    # 获取顶点索引并检查有效性
+                    idx_a, idx_b, idx_c = mesh_element.vertex_indices
+                    if not (
+                            0 <= idx_a < num_obj_vertices and 0 <= idx_b < num_obj_vertices and 0 <= idx_c < num_obj_vertices):
+                        continue
 
-                    # Calculate v0, e1, e2
+                    # 获取顶点坐标
+                    # 使用 try-except 捕获可能的无效索引错误 (理论上不应发生，但作为保险)
+                    try:
+                        v_a_tuple = obj_vertices[idx_a]
+                        v_b_tuple = obj_vertices[idx_b]
+                        v_c_tuple = obj_vertices[idx_c]
+                    except IndexError:
+                        continue  # 如果索引无效，跳过这个面
+
+                    # 转换为 NumPy 数组进行计算
+                    v_a = np.array(v_a_tuple, dtype=GEOMETRY_DTYPE)
+                    v_b = np.array(v_b_tuple, dtype=GEOMETRY_DTYPE)
+                    v_c = np.array(v_c_tuple, dtype=GEOMETRY_DTYPE)
+
+                    # 计算 v0, e1, e2
                     v0 = v_a
                     e1 = v_b - v_a
                     e2 = v_c - v_a
 
-                    # Calculate face normal
+                    # 计算法线并检查退化三角形
                     normal = np.cross(e1, e2)
                     norm_len_sq = np.dot(normal, normal)
-
-                    # Skip degenerate triangles (zero area)
-                    if norm_len_sq < (1e-9) ** 2:  # Use a small epsilon squared
+                    if norm_len_sq < 1e-18:  # 使用更小的容差判断退化
                         skipped_degenerate += 1
                         continue
 
-                    # Normalize the normal
+                    # 标准化法线
                     normal /= np.sqrt(norm_len_sq)
 
-                    # Append data to lists
-                    all_v0s.append(v0)
-                    all_e1s.append(e1)
-                    all_e2s.append(e2)
-                    all_normals.append(normal)
-                    all_labels.append(label_id)
-                    all_colors.append(base_color)  # Use the object's color
+                    # 获取颜色
+                    triangle_color = mesh_element.color
+
+                    # 添加到列表
+                    all_v0s_list.append(v0)
+                    all_e1s_list.append(e1)
+                    all_e2s_list.append(e2)
+                    all_normals_list.append(normal)
+                    all_labels_list.append(label_id)
+                    all_colors_list.append(triangle_color)
                     used_label_ids.add(label_id)
                     processed_triangles += 1
 
-                except IndexError:
-                    # This catch block might be redundant due to the checks above, but good safety
-                    print(
-                        f"  🔴 处理 object '{obj.object_id}' (类型 {obj_type}) 的 mesh {mesh_element.mesh_id} 时发生索引错误。 Indices: {mesh_element.vertex_indices}, Vertices: {num_obj_vertices}")
-                    continue
                 except Exception as e:
-                    print(
-                        f"  🔴 处理 object '{obj.object_id}' (类型 {obj_type}) 的 mesh {mesh_element.mesh_id} 时发生未知错误: {e}")
-                    continue
+                    # print(f"  🔴 处理对象 '{obj.object_id}' 的面片 {mesh_element.mesh_id} 时发生未知错误: {e}")
+                    pass  # 减少错误输出
 
-        if not all_v0s:
-            print("  未处理任何有效的三角形。")
+            # 展平进度报告
+            if (i + 1) % flatten_report_interval == 0 or (i + 1) == total_objs:
+                print(f"\r  ● 展平进度: {i + 1}/{total_objs} 个对象...", end="")
+        print()  # 换行
+
+        if not all_v0s_list:
+            print("  未处理任何有效的三角形用于展平。")
             return None
 
-        # Generate final label_map and color_map based on *used* labels
-        final_label_map = {lbl: name for name, lbl in TYPE_TO_LABEL_MAP.items() if lbl in used_label_ids}
-        # Create a color map mapping the used label IDs to the corresponding colors
-        # We need the original string->color map (COLOR_MAP)
-        final_color_map = {}
-        reverse_type_map = {v: k for k, v in TYPE_TO_LABEL_MAP.items()}  # Map label back to type string
-        for label_id in used_label_ids:
-            type_str = reverse_type_map.get(label_id)
-            if type_str:
-                color = COLOR_MAP.get(type_str)  # Get color from original map
-                if color is not None:
-                    final_color_map[label_id] = color
-                else:  # Fallback if type somehow not in COLOR_MAP
-                    final_color_map[label_id] = DEFAULT_COLOR
-            else:  # Fallback if label not in reverse map
-                final_color_map[label_id] = DEFAULT_COLOR
-
-        # Convert lists to NumPy arrays
+        print("  ⏳ 正在将列表转换为 NumPy 数组...")
+        t_convert_start = time.time()
+        # 最终将列表转换为 NumPy 数组
         result = {
-            "v0s": np.array(all_v0s, dtype=GEOMETRY_DTYPE),
-            "e1s": np.array(all_e1s, dtype=GEOMETRY_DTYPE),
-            "e2s": np.array(all_e2s, dtype=GEOMETRY_DTYPE),
-            "normals": np.array(all_normals, dtype=GEOMETRY_DTYPE),
-            "labels": np.array(all_labels, dtype=LABEL_DTYPE),
-            "colors": np.array(all_colors, dtype=COLOR_DTYPE),
-            "label_map": final_label_map,  # Map of ID -> Type Name (for used labels)
-            "color_map": final_color_map,  # Map of ID -> Color (for used labels)
+            "v0s": np.array(all_v0s_list, dtype=GEOMETRY_DTYPE),
+            "e1s": np.array(all_e1s_list, dtype=GEOMETRY_DTYPE),
+            "e2s": np.array(all_e2s_list, dtype=GEOMETRY_DTYPE),
+            "normals": np.array(all_normals_list, dtype=GEOMETRY_DTYPE),
+            "labels": np.array(all_labels_list, dtype=LABEL_DTYPE),
+            "colors": np.array(all_colors_list, dtype=COLOR_DTYPE),
         }
+        t_convert_end = time.time()
+        print(f"  ✔ NumPy 数组转换完成 (耗时: {t_convert_end - t_convert_start:.3f}s)")
+
+        # --- 生成最终的标签和颜色映射 ---
+        print("  ⏳ 正在生成标签和颜色映射...")
+        final_label_map = {}
+        final_color_map = {}
+        reverse_type_map_full = {v: k for k, v in TYPE_TO_LABEL_MAP.items()}
+        for label_id in used_label_ids:
+            type_str = reverse_type_map_full.get(label_id, f"UnknownLabel_{label_id}")
+            final_label_map[label_id] = type_str
+            color = COLOR_MAP.get(type_str)
+            if color is not None:
+                final_color_map[label_id] = color  # <--- 修改点：直接存储 numpy 数组
+            else:
+                final_color_map[label_id] = DEFAULT_COLOR  # <--- 修改点：直接存储 numpy 数组
+
+        result["label_map"] = final_label_map
+        result["color_map"] = final_color_map
+        print("  ✔ 标签和颜色映射生成完毕。")
 
         elapsed = time.time() - t0_flatten
-        print(
-            f"✔ 完成几何体 flattening: {processed_triangles} 个三角形 (跳过 {skipped_degenerate} 个退化三角形)。 耗时: {elapsed:.3f}s")
-        # print(f"  使用的标签 ID: {used_label_ids}")
-        # print(f"  最终标签映射: {final_label_map}")
-        # print(f"  最终颜色映射: {final_color_map}")
+        print(f"✔ 完成几何体展平: 处理了 {processed_triangles} 个有效三角形。")
+        print(f"   (跳过 {skipped_degenerate} 个退化三角形, 跳过 {skipped_ignored_label} 个忽略标签的三角形)")
+        print(f"   展平总耗时: {elapsed:.3f}s")
+
+        # 打印最终数组形状以供检查
+        # print("  展平后数组形状:")
+        # for key, arr in result.items():
+        #     if isinstance(arr, np.ndarray):
+        #         print(f"    {key}: {arr.shape}")
 
         return result
 
@@ -1246,31 +1448,45 @@ if __name__ == "__main__":
 
     # --- 配置 ---
     # Use raw strings (r"...") or forward slashes for paths
-    JSON_MODEL_PATH = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\processed\project\processed_model.json"
-    OBJ_TERRAIN_PATH = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\processed\project\北侧地形.obj"
-    TREE_PATH = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\row_map\greening\tree20250203_converted.json"
-    MORE_TREE_PATH = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\row_map\greening\VIS_INV_TREE_CSDI_202503171731_converted.json"
-    MOREMORE_TREE_PATH = r"E:\Code\HITSZ\UrbanWindowVisionKG\library\HK_map\row_map\greening\dataset_29_layer.json"
+    JSON_MODEL_PATH = r"D:\Code\UrbanWindowVisionKG\library\HK_map\processed\project\processed_model.json"
+    OBJ_TERRAIN_PATH = r"D:\Code\UrbanWindowVisionKG\library\HK_map\processed\project\北侧地形.obj"
+    TREE_PATH = r"D:\Code\UrbanWindowVisionKG\library\HK_map\row_map\greening\tree20250203_converted.json"
+    MORE_TREE_PATH = r"D:\Code\UrbanWindowVisionKG\library\HK_map\row_map\greening\VIS_INV_TREE_CSDI_202503171731_converted.json"
+    MOREMORE_TREE_PATH = r"D:\Code\UrbanWindowVisionKG\library\HK_map\row_map\greening\dataset_29_layer.json"
     OUTPUT_OBJ_PATH = "demo_scene_v4_detailed.obj" # Changed output name slightly
     ELEMENT_LIMIT = None # 设置为 None 处理所有元素，或设置为一个数字 (e.g., 1000) 来限制处理数量
     REPORT_INTERVAL = 1000 # 每处理 1000 个元素汇报一次
 
     # --- 准备工作 ---
     scene = Scene()
-    scene.plan_trees(TREE_PATH)
-    scene.plan_trees_v2(MORE_TREE_PATH)
-    scene.plan_trees_v3(MOREMORE_TREE_PATH)
+    # scene.plan_trees(TREE_PATH)
+    # scene.plan_trees_v2(MORE_TREE_PATH)
+    # scene.plan_trees_v3(MOREMORE_TREE_PATH)
 
     # --- 加载 DataModel ---
-    # print(f"\n▶ Loading DataModel from: {JSON_MODEL_PATH}")
-    # model = ARTShapelyDataExchanger.read_json_file(JSON_MODEL_PATH)
-    # elements_to_load = model.elements
+    print(f"\n▶ Loading DataModel from: {JSON_MODEL_PATH}")
+    model = ARTShapelyDataExchanger.read_json_file(JSON_MODEL_PATH)
+    elements_to_load = model.elements
 
     # --- 处理 DataElements ---
-    # if elements_to_load: # Only proceed if elements were loaded
-    #     scene.load_elements(elements_to_load, report_interval=REPORT_INTERVAL)
-    # else:
-    #     print("ℹ️ No DataElements loaded, skipping element processing.")
+    WINDOW_METADATA_OUTPUT_PATH = "test_window.json"
+    # --- 定义测试用AOI - --
+    # !! 同样，这里的坐标需要根据你的 processed_model.json 中的建筑实际位置调整 !!
+    TEST_AOI_MIN_X, TEST_AOI_MIN_Y = 830000, 814400
+    TEST_AOI_MAX_X, TEST_AOI_MAX_Y = 840500, 824600
+
+    TEST_WINDOW_AOI_WKT = f"POLYGON (({TEST_AOI_MIN_X} {TEST_AOI_MIN_Y}, {TEST_AOI_MAX_X} {TEST_AOI_MIN_Y}, {TEST_AOI_MAX_X} {TEST_AOI_MAX_Y}, {TEST_AOI_MIN_X} {TEST_AOI_MAX_Y}, {TEST_AOI_MIN_X} {TEST_AOI_MIN_Y}))"
+    print(f"测试用窗户生成 AOI WKT: {TEST_WINDOW_AOI_WKT}")
+    if elements_to_load: # Only proceed if elements were loaded
+        scene.load_elements(elements_to_load, report_interval=REPORT_INTERVAL,
+                            # --- 传递窗户生成参数 ---
+                            generate_windows_flag=True,  # 启用窗户生成
+                            window_aoi_wkt=TEST_WINDOW_AOI_WKT,  # 使用测试 AOI
+                            window_metadata_output_path=WINDOW_METADATA_OUTPUT_PATH,  # 指定输出路径
+                            # window_config={"floor_height_m": 3.1} # 可选：传递自定义配置
+                            )
+    else:
+        print("ℹ️ No DataElements loaded, skipping element processing.")
 
     # --- 加载 OBJ 地形 ---
     # terrain_path = Path(OBJ_TERRAIN_PATH)
